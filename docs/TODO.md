@@ -31,9 +31,10 @@
 - [x] Konfiguration via Annotation (`resizer.io/cooldown-minutes`)
 
 ## Phase 5: Deployment
-- [ ] Helm Chart erstellen
-- [ ] CI/CD Pipeline für Releases
-- [ ] Dokumentation aktualisieren (Installation, Konfiguration)
+- [x] Kustomize Manifests (`config/`)
+- [x] Static Install Manifest (`dist/install.yaml`)
+- [x] CI/CD Pipeline für Releases (`.github/workflows/release.yml`)
+- [x] Dokumentation aktualisieren (Installation, Konfiguration)
 
 ## Phase 6: Future Work
 - [ ] Metrics Export (Prometheus)
