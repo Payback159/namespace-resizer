@@ -58,42 +58,91 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-      - command:
-        - /manager
-        args:
-          - --leader-elect
-          - --health-probe-bind-address=:8081
-        image: controller:latest
-        name: manager
-        ports: []
-        securityContext:
-          readOnlyRootFilesystem: true
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - "ALL"
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: 8081
-          initialDelaySeconds: 15
-          periodSeconds: 20
-        readinessProbe:
-          httpGet:
-            path: /readyz
-            port: 8081
-          initialDelaySeconds: 5
-          periodSeconds: 10
-        # TODO(user): Configure the resources accordingly based on the project requirements.
-        # More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-        resources:
-          limits:
-            cpu: 500m
-            memory: 128Mi
-          requests:
-            cpu: 10m
-            memory: 64Mi
-        volumeMounts: []
+        - command:
+            - /manager
+          args:
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+          image: controller:latest
+          name: manager
+          ports: []
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - "ALL"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          # TODO(user): Configure the resources accordingly based on the project requirements.
+          # More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+          resources:
+            limits:
+              cpu: 500m
+              memory: 128Mi
+            requests:
+              cpu: 10m
+              memory: 64Mi
+          env:
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: github-auth
+                  key: app-id
+                  optional: true
+            - name: GITHUB_INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: github-auth
+                  key: installation-id
+                  optional: true
+            - name: GITHUB_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: github-auth
+                  key: private-key
+                  optional: true
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-auth
+                  key: token
+                  optional: true
+            - name: GITHUB_OWNER
+              valueFrom:
+                configMapKeyRef:
+                  name: resizer-config
+                  key: github-owner
+                  optional: true
+            - name: GITHUB_REPO
+              valueFrom:
+                configMapKeyRef:
+                  name: resizer-config
+                  key: github-repo
+                  optional: true
+            - name: CLUSTER_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: resizer-config
+                  key: cluster-name
+                  optional: true
+            - name: GIT_PATH_TEMPLATE
+              valueFrom:
+                configMapKeyRef:
+                  name: resizer-config
+                  key: git-path-template
+                  optional: true
+          volumeMounts: []
       volumes: []
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10

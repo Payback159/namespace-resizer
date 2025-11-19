@@ -193,6 +193,17 @@ subjects:
   namespace: namespace-resizer-system
 ---
 apiVersion: v1
+data:
+  cluster-name: demo-cluster
+  git-path-template: managed-resources/{{ .Cluster }}/{{ .Namespace }}
+  github-owner: Payback159
+  github-repo: ns-resizer-demo
+kind: ConfigMap
+metadata:
+  name: namespace-resizer-resizer-config
+  namespace: namespace-resizer-system
+---
+apiVersion: v1
 kind: Service
 metadata:
   labels:
@@ -241,6 +252,55 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
+        env:
+        - name: GITHUB_APP_ID
+          valueFrom:
+            secretKeyRef:
+              key: app-id
+              name: github-auth
+              optional: true
+        - name: GITHUB_INSTALLATION_ID
+          valueFrom:
+            secretKeyRef:
+              key: installation-id
+              name: github-auth
+              optional: true
+        - name: GITHUB_PRIVATE_KEY
+          valueFrom:
+            secretKeyRef:
+              key: private-key
+              name: github-auth
+              optional: true
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: token
+              name: github-auth
+              optional: true
+        - name: GITHUB_OWNER
+          valueFrom:
+            configMapKeyRef:
+              key: github-owner
+              name: namespace-resizer-resizer-config
+              optional: true
+        - name: GITHUB_REPO
+          valueFrom:
+            configMapKeyRef:
+              key: github-repo
+              name: namespace-resizer-resizer-config
+              optional: true
+        - name: CLUSTER_NAME
+          valueFrom:
+            configMapKeyRef:
+              key: cluster-name
+              name: namespace-resizer-resizer-config
+              optional: true
+        - name: GIT_PATH_TEMPLATE
+          valueFrom:
+            configMapKeyRef:
+              key: git-path-template
+              name: namespace-resizer-resizer-config
+              optional: true
         image: controller:latest
         livenessProbe:
           httpGet:

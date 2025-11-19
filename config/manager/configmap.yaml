@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: resizer-config
+  namespace: system
+data:
+  github-owner: "Payback159"
+  github-repo: "ns-resizer-demo"
+  cluster-name: "demo-cluster"
+  git-path-template: "managed-resources/{{ .Cluster }}/{{ .Namespace }}"
