@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strconv"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -183,12 +184,36 @@ func main() {
 	githubRepo := os.Getenv("GITHUB_REPO")
 	clusterName := os.Getenv("CLUSTER_NAME")
 
-	if githubToken == "" || githubOwner == "" || githubRepo == "" || clusterName == "" {
-		setupLog.Error(nil, "GitHub configuration missing", "token", githubToken != "", "owner", githubOwner, "repo", githubRepo, "cluster", clusterName)
+	// GitHub App Config
+	githubAppID := os.Getenv("GITHUB_APP_ID")
+	githubInstallID := os.Getenv("GITHUB_INSTALLATION_ID")
+	githubPrivateKey := os.Getenv("GITHUB_PRIVATE_KEY")
+
+	var gitProvider git.Provider
+	var errProvider error
+
+	if githubAppID != "" && githubInstallID != "" && githubPrivateKey != "" {
+		setupLog.Info("Using GitHub App authentication")
+		appID, _ := strconv.ParseInt(githubAppID, 10, 64)
+		installID, _ := strconv.ParseInt(githubInstallID, 10, 64)
+		gitProvider, errProvider = git.NewGitHubAppProvider(appID, installID, []byte(githubPrivateKey), githubOwner, githubRepo, clusterName)
+		if errProvider != nil {
+			setupLog.Error(errProvider, "failed to create GitHub App provider")
+			os.Exit(1)
+		}
+	} else if githubToken != "" {
+		setupLog.Info("Using GitHub Token authentication")
+		gitProvider = git.NewGitHubProvider(githubToken, githubOwner, githubRepo, clusterName)
+	} else {
+		setupLog.Error(nil, "GitHub configuration missing. Provide either GITHUB_TOKEN or GITHUB_APP_ID/INSTALLATION_ID/PRIVATE_KEY")
 		os.Exit(1)
 	}
 
-	gitProvider := git.NewGitHubProvider(githubToken, githubOwner, githubRepo, clusterName)
+	if githubOwner == "" || githubRepo == "" || clusterName == "" {
+		setupLog.Error(nil, "GitHub configuration missing", "owner", githubOwner, "repo", githubRepo, "cluster", clusterName)
+		os.Exit(1)
+	}
+
 	locker := lock.NewLeaseLocker(mgr.GetClient())
 
 	if err := (&controller.ResourceQuotaReconciler{

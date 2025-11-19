@@ -6,21 +6,35 @@
 - [x] Konzept: Event-Driven Resizing für Burst-Szenarien (Deployments, StatefulSets, Jobs)
 - [x] Konzept: GitOps-Strategie (Phase 1: Observer Mode, Phase 2: GitHub PRs)
 
-## Phase 2: Implementierung (Observer Mode)
-- [ ] Skeleton des Controllers aufsetzen (Sprache: Go? Framework: Kubebuilder?)
-- [ ] **Modul 1: Metrik-Beobachter**
-    - [ ] Watcher für ResourceQuotas
-    - [ ] Berechnung: `used / hard` vs Threshold
-- [ ] **Modul 2: Event-Beobachter**
-    - [ ] Watcher für Events (`FailedCreate`)
-    - [ ] Parser für Fehlermeldungen ("requested: x, used: y")
-- [ ] **Modul 3: Policy & Berechnung**
-    - [ ] Logik für Increment, Cooldown, Max Step
-- [ ] **Modul 4: Reporter (statt Aktor)**
-    - [ ] Strukturiertes Logging der Empfehlung
-    - [ ] Emittieren von Kubernetes Events (`QuotaResizeRecommended`)
+## Phase 2: Implementierung (Observer Mode) (Abgeschlossen)
+- [x] Skeleton des Controllers aufsetzen (Go, Kubebuilder)
+- [x] **Modul 1: Metrik-Beobachter**
+    - [x] Watcher für ResourceQuotas
+    - [x] Berechnung: `used / hard` vs Threshold
+- [x] **Modul 2: Event-Beobachter**
+    - [x] Watcher für Events (`FailedCreate`)
+    - [x] Parser für Fehlermeldungen ("requested: x, used: y")
+- [x] **Modul 3: Policy & Berechnung**
+    - [x] Logik für Increment
+- [x] **Modul 4: Reporter**
+    - [x] Strukturiertes Logging der Empfehlung
+    - [x] Kubernetes Events
 
-## Phase 3: Git Integration (GitHub)
-- [ ] GitHub Client Integration
-- [ ] Logik zum Finden der Quota-Datei im Repo
-- [ ] Erstellen von Pull Requests mit neuen Werten
+## Phase 3: GitOps & Locking (Abgeschlossen)
+- [x] GitHub Integration (PR Erstellung)
+- [x] Locking Mechanismus (K8s Leases)
+- [x] Stale Event Prevention
+- [x] Zombie Lock Prevention
+
+## Phase 4: Stabilität & Cooldown (In Arbeit)
+- [x] Cooldown Mechanismus (K8s Leases)
+- [x] Konfiguration via Annotation (`resizer.io/cooldown-minutes`)
+
+## Phase 5: Deployment
+- [ ] Helm Chart erstellen
+- [ ] CI/CD Pipeline für Releases
+- [ ] Dokumentation aktualisieren (Installation, Konfiguration)
+
+## Phase 6: Future Work
+- [ ] Metrics Export (Prometheus)
+- [ ] Webhook für Validierung

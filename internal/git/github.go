@@ -3,9 +3,11 @@ package git
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
+	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/google/go-github/v60/github"
 	"golang.org/x/oauth2"
 	corev1 "k8s.io/api/core/v1"
@@ -42,6 +44,20 @@ func NewGitHubProvider(token, owner, repo, clusterName string) *GitHubProvider {
 		repo:        repo,
 		clusterName: clusterName,
 	}
+}
+
+func NewGitHubAppProvider(appID, installationID int64, privateKey []byte, owner, repo, clusterName string) (*GitHubProvider, error) {
+	itr, err := ghinstallation.New(http.DefaultTransport, appID, installationID, privateKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return &GitHubProvider{
+		client:      github.NewClient(&http.Client{Transport: itr}),
+		owner:       owner,
+		repo:        repo,
+		clusterName: clusterName,
+	}, nil
 }
 
 func (g *GitHubProvider) GetPRStatus(ctx context.Context, prID int) (*PRStatus, error) {

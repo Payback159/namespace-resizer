@@ -43,15 +43,11 @@ $$ \text{NewLimit} = \text{CurrentLimit} \times (1 + \text{IncrementFactor}) $$
 
 ### 2.4. Sicherheits-Mechanismen (Guardrails)
 
-Um "unkontrolliertes Wachstum in kurzer Zeit" zu verhindern, werden folgende Bremsen eingebaut:
+Um "unkontrolliertes Wachstum in kurzer Zeit" zu verhindern, wird folgende Bremse eingebaut:
 
 1.  **Cooldown Period (Zeit-Sperre):**
     Nach einer Anpassung (oder Empfehlung) darf für einen definierten Zeitraum (z.B. 1h oder 24h) keine weitere Erhöhung stattfinden.
     *Parameter:* `cooldown_minutes`
-
-2.  **Max Step Cap (Schritt-Begrenzung):**
-    Auch wenn der `IncrementFactor` 50% wäre, kann eine absolute Obergrenze pro Schritt definiert werden (z.B. "Erhöhe nie um mehr als 4 Cores auf einmal").
-    *Parameter:* `max_step_absolute`
 
 ### 2.5. Konfiguration (Policy & Scope)
 

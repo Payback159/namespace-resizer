@@ -100,11 +100,11 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 		percentage := (float64(usedVal) / float64(limitVal)) * 100
 
-		if percentage >= config.Threshold {
-			logger.Info("Threshold exceeded", "resource", resName, "usage", percentage, "threshold", config.Threshold)
+		if percentage >= config.GetThreshold(resName) {
+			logger.Info("Threshold exceeded", "resource", resName, "usage", percentage, "threshold", config.GetThreshold(resName))
 
 			// Calculate new limit
-			increment := float64(limitVal) * config.IncrementFactor
+			increment := float64(limitVal) * config.GetIncrement(resName)
 			newLimitVal := int64(float64(limitVal) + increment)
 
 			newLimit := *resource.NewMilliQuantity(newLimitVal, hardLimit.Format)
@@ -153,6 +153,16 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				logger.Error(err, "failed to release lock")
 				return ctrl.Result{}, err
 			}
+
+			// If merged, set Cooldown
+			if status.IsMerged {
+				logger.Info("PR merged, setting cooldown", "duration", config.Cooldown)
+				if err := r.Locker.SetCooldown(ctx, req.Namespace, quota.Name); err != nil {
+					logger.Error(err, "failed to set cooldown")
+					// Don't fail reconcile, just log
+				}
+			}
+
 			// Requeue to start fresh
 			return ctrl.Result{Requeue: true}, nil
 		} else {
@@ -172,7 +182,18 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			}
 		}
 	} else if needsResize {
-		// No Lock AND Needs Resize -> Create PR & Acquire Lock
+		// No Lock AND Needs Resize
+
+		// Check Cooldown
+		inCooldown, err := r.Locker.CheckCooldown(ctx, req.Namespace, quota.Name, config.Cooldown)
+		if err != nil {
+			logger.Error(err, "failed to check cooldown")
+			return ctrl.Result{}, err
+		}
+		if inCooldown {
+			logger.Info("Skipping resize due to cooldown", "cooldown", config.Cooldown)
+			return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+		}
 
 		// Log recommendation
 		for res, newLimit := range recommendations {
@@ -268,12 +289,19 @@ func (r *ResourceQuotaReconciler) analyzeEvents(ctx context.Context, quota corev
 
 							// Add buffer (e.g. 10% or config.Increment)
 							// Let's use config.IncrementFactor as buffer
-							buffer := float64(needed.MilliValue()) * config.IncrementFactor
+							buffer := float64(needed.MilliValue()) * config.GetIncrement(resName)
 							needed.Add(*resource.NewMilliQuantity(int64(buffer), currentHard.Format))
 
 							// Only recommend if the new limit is actually higher than the current limit
 							if needed.Cmp(currentHard) > 0 {
-								recommendations[resName] = needed
+								// Check if we already have a higher recommendation for this resource
+								if existing, ok := recommendations[resName]; ok {
+									if needed.Cmp(existing) > 0 {
+										recommendations[resName] = needed
+									}
+								} else {
+									recommendations[resName] = needed
+								}
 							}
 						}
 					}
@@ -285,35 +313,132 @@ func (r *ResourceQuotaReconciler) analyzeEvents(ctx context.Context, quota corev
 }
 
 type ResizerConfig struct {
-	Threshold       float64 // e.g. 80.0
-	IncrementFactor float64 // e.g. 0.2 for 20%
-	Cooldown        time.Duration
+	Thresholds       map[corev1.ResourceName]float64
+	IncrementFactors map[corev1.ResourceName]float64
+	Cooldown         time.Duration
+}
+
+func (c ResizerConfig) GetThreshold(res corev1.ResourceName) float64 {
+	// Check for specific resource match
+	if v, ok := c.Thresholds[res]; ok {
+		return v
+	}
+	// Check for resource type match (e.g. requests.cpu -> cpu)
+	if strings.Contains(string(res), "cpu") {
+		if v, ok := c.Thresholds[corev1.ResourceCPU]; ok {
+			return v
+		}
+	}
+	if strings.Contains(string(res), "memory") {
+		if v, ok := c.Thresholds[corev1.ResourceMemory]; ok {
+			return v
+		}
+	}
+	if strings.Contains(string(res), "storage") {
+		if v, ok := c.Thresholds[corev1.ResourceStorage]; ok {
+			return v
+		}
+	}
+	// Fallback to default
+	if v, ok := c.Thresholds["default"]; ok {
+		return v
+	}
+	return 80.0
+}
+
+func (c ResizerConfig) GetIncrement(res corev1.ResourceName) float64 {
+	if v, ok := c.IncrementFactors[res]; ok {
+		return v
+	}
+	if strings.Contains(string(res), "cpu") {
+		if v, ok := c.IncrementFactors[corev1.ResourceCPU]; ok {
+			return v
+		}
+	}
+	if strings.Contains(string(res), "memory") {
+		if v, ok := c.IncrementFactors[corev1.ResourceMemory]; ok {
+			return v
+		}
+	}
+	if strings.Contains(string(res), "storage") {
+		if v, ok := c.IncrementFactors[corev1.ResourceStorage]; ok {
+			return v
+		}
+	}
+	if v, ok := c.IncrementFactors["default"]; ok {
+		return v
+	}
+	return 0.2
 }
 
 func parseConfig(annotations map[string]string) ResizerConfig {
-	// Defaults
 	config := ResizerConfig{
-		Threshold:       80.0,
-		IncrementFactor: 0.2,
-		Cooldown:        60 * time.Minute,
+		Thresholds:       make(map[corev1.ResourceName]float64),
+		IncrementFactors: make(map[corev1.ResourceName]float64),
+		Cooldown:         60 * time.Minute,
 	}
 
-	if val, ok := annotations["resizer.io/cpu-threshold"]; ok {
-		if v, err := strconv.ParseFloat(val, 64); err == nil {
-			config.Threshold = v
-		}
-	}
-	// Note: In a real implementation, we would parse per-resource annotations.
-	// For MVP, we use global or cpu-specific as generic.
+	// Set Defaults
+	config.Thresholds["default"] = 80.0
+	config.IncrementFactors["default"] = 0.2
 
-	if val, ok := annotations["resizer.io/cpu-increment"]; ok {
-		// Handle "20%" or "0.2"
+	// Helper to parse percentage
+	parsePercent := func(val string) (float64, bool) {
 		clean := strings.TrimSuffix(val, "%")
-		if v, err := strconv.ParseFloat(clean, 64); err == nil {
-			if strings.HasSuffix(val, "%") {
-				config.IncrementFactor = v / 100.0
-			} else {
-				config.IncrementFactor = v
+		v, err := strconv.ParseFloat(clean, 64)
+		if err != nil {
+			return 0, false
+		}
+		if strings.HasSuffix(val, "%") {
+			return v / 100.0, true
+		}
+		return v, true // Assume raw float (0.2) or int (80) depending on context?
+		// For threshold we expect 80. For increment we expect 0.2 or 20%.
+		// Let's handle them separately in the loop if needed, or just be smart.
+	}
+
+	for k, v := range annotations {
+		if !strings.HasPrefix(k, "resizer.io/") {
+			continue
+		}
+		key := strings.TrimPrefix(k, "resizer.io/")
+
+		// Thresholds
+		if strings.HasSuffix(key, "-threshold") {
+			// e.g. "threshold", "cpu-threshold", "requests.memory-threshold"
+			res := strings.TrimSuffix(key, "-threshold")
+			if res == "" {
+				res = "default"
+			}
+
+			if val, err := strconv.ParseFloat(v, 64); err == nil {
+				config.Thresholds[corev1.ResourceName(res)] = val
+			}
+		}
+
+		// Increments
+		if strings.HasSuffix(key, "-increment") {
+			res := strings.TrimSuffix(key, "-increment")
+			if res == "" {
+				res = "default"
+			}
+
+			if val, ok := parsePercent(v); ok {
+				// If user wrote "20", parsePercent returns 20. But for increment we want 0.2?
+				// Or maybe we standardize on "0.2" or "20%".
+				// If > 1, assume percentage? No, 2.0 means 200%.
+				// Let's stick to: if "%" suffix -> /100. If no suffix -> raw value.
+				// But for threshold "80" means 80%.
+				// Let's assume threshold is always 0-100.
+				// Increment: "0.2" = 20%. "20%" = 20%.
+				config.IncrementFactors[corev1.ResourceName(res)] = val
+			}
+		}
+
+		// Cooldown
+		if key == "cooldown-minutes" {
+			if val, err := strconv.Atoi(v); err == nil {
+				config.Cooldown = time.Duration(val) * time.Minute
 			}
 		}
 	}

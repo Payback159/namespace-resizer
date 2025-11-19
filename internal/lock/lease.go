@@ -3,6 +3,7 @@ package lock
 import (
 	"context"
 	"fmt"
+	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -111,4 +112,60 @@ func (l *LeaseLocker) ReleaseLock(ctx context.Context, targetNS, quotaName strin
 	lease.Namespace = ControllerNamespace
 
 	return client.IgnoreNotFound(l.client.Delete(ctx, &lease))
+}
+
+// SetCooldown creates a lease to mark the start of a cooldown period
+func (l *LeaseLocker) SetCooldown(ctx context.Context, targetNS, quotaName string) error {
+	leaseName := fmt.Sprintf("cooldown-%s-%s", targetNS, quotaName)
+	identity := "cooldown"
+
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      leaseName,
+			Namespace: ControllerNamespace,
+			Labels: map[string]string{
+				"resizer.io/target-ns": targetNS,
+				"resizer.io/quota":     quotaName,
+				"resizer.io/type":      "cooldown",
+			},
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity: &identity,
+			AcquireTime:    &metav1.MicroTime{Time: metav1.Now().Time},
+		},
+	}
+
+	// If it exists, update the time
+	if err := l.client.Delete(ctx, lease); err != nil && !errors.IsNotFound(err) {
+		return err
+	}
+	return l.client.Create(ctx, lease)
+}
+
+// CheckCooldown returns true if we are still in cooldown period
+func (l *LeaseLocker) CheckCooldown(ctx context.Context, targetNS, quotaName string, duration time.Duration) (bool, error) {
+	leaseName := fmt.Sprintf("cooldown-%s-%s", targetNS, quotaName)
+	var lease coordinationv1.Lease
+
+	err := l.client.Get(ctx, client.ObjectKey{Name: leaseName, Namespace: ControllerNamespace}, &lease)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if lease.Spec.AcquireTime == nil {
+		return false, nil
+	}
+
+	// Check if AcquireTime + Duration > Now
+	expiry := lease.Spec.AcquireTime.Time.Add(duration)
+	if time.Now().Before(expiry) {
+		return true, nil
+	}
+
+	// Cooldown expired, cleanup
+	_ = l.client.Delete(ctx, &lease)
+	return false, nil
 }
