@@ -1,0 +1,254 @@
+package git
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/go-github/v60/github"
+	"golang.org/x/oauth2"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+)
+
+type Provider interface {
+	GetPRStatus(ctx context.Context, prID int) (*PRStatus, error)
+	CreatePR(ctx context.Context, quotaName, namespace string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error)
+	UpdatePR(ctx context.Context, prID int, quotaName, namespace string, newLimits map[corev1.ResourceName]resource.Quantity) error
+}
+
+type PRStatus struct {
+	IsOpen   bool
+	IsMerged bool
+	// We could store current proposed limits here to compare
+}
+
+type GitHubProvider struct {
+	client      *github.Client
+	owner       string
+	repo        string
+	clusterName string
+}
+
+func NewGitHubProvider(token, owner, repo, clusterName string) *GitHubProvider {
+	ts := oauth2.StaticTokenSource(
+		&oauth2.Token{AccessToken: token},
+	)
+	tc := oauth2.NewClient(context.Background(), ts)
+	return &GitHubProvider{
+		client:      github.NewClient(tc),
+		owner:       owner,
+		repo:        repo,
+		clusterName: clusterName,
+	}
+}
+
+func (g *GitHubProvider) GetPRStatus(ctx context.Context, prID int) (*PRStatus, error) {
+	pr, _, err := g.client.PullRequests.Get(ctx, g.owner, g.repo, prID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &PRStatus{
+		IsOpen:   pr.GetState() == "open",
+		IsMerged: pr.GetMerged(),
+	}, nil
+}
+
+func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error) {
+	// 1. Get default branch ref
+	repo, _, err := g.client.Repositories.Get(ctx, g.owner, g.repo)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get repo: %w", err)
+	}
+	baseRef, _, err := g.client.Git.GetRef(ctx, g.owner, g.repo, "refs/heads/"+repo.GetDefaultBranch())
+	if err != nil {
+		return 0, fmt.Errorf("failed to get base ref: %w", err)
+	}
+
+	// 2. Create new branch
+	branchName := fmt.Sprintf("resize/%s-%s-%d", namespace, quotaName, time.Now().Unix())
+	newRef := &github.Reference{
+		Ref: github.String("refs/heads/" + branchName),
+		Object: &github.GitObject{
+			SHA: baseRef.Object.SHA,
+		},
+	}
+	_, _, err = g.client.Git.CreateRef(ctx, g.owner, g.repo, newRef)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create branch: %w", err)
+	}
+
+	// 3. Find the file
+	// Path convention: managed-resources/<cluster-name>/<namespace>/
+	// We need to find a file that contains the ResourceQuota definition.
+	basePath := fmt.Sprintf("managed-resources/%s/%s", g.clusterName, namespace)
+
+	targetFile, fileContent, err := g.findQuotaFile(ctx, basePath, branchName, quotaName)
+	if err != nil {
+		return 0, fmt.Errorf("failed to find quota file in %s: %w", basePath, err)
+	}
+
+	content, err := fileContent.GetContent()
+	if err != nil {
+		return 0, err
+	}
+
+	// 4. Apply changes to content
+	newContent := applyChangesToYaml(content, newLimits)
+
+	// 5. Commit changes
+	opts := &github.RepositoryContentFileOptions{
+		Message:   github.String(fmt.Sprintf("chore(%s): resize quota %s", namespace, quotaName)),
+		Content:   []byte(newContent),
+		SHA:       fileContent.SHA,
+		Branch:    github.String(branchName),
+		Committer: &github.CommitAuthor{Name: github.String("Namespace Resizer"), Email: github.String("bot@resizer.io")},
+	}
+	_, _, err = g.client.Repositories.UpdateFile(ctx, g.owner, g.repo, targetFile, opts)
+	if err != nil {
+		return 0, fmt.Errorf("failed to commit file: %w", err)
+	}
+
+	// 6. Create PR
+	newPR := &github.NewPullRequest{
+		Title:               github.String(fmt.Sprintf("Resize Quota %s in %s", quotaName, namespace)),
+		Head:                github.String(branchName),
+		Base:                github.String(repo.GetDefaultBranch()),
+		Body:                github.String(generatePRBody(namespace, quotaName, newLimits)),
+		MaintainerCanModify: github.Bool(true),
+	}
+
+	pr, _, err := g.client.PullRequests.Create(ctx, g.owner, g.repo, newPR)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create PR: %w", err)
+	}
+
+	// 7. Add Labels
+	_, _, err = g.client.Issues.AddLabelsToIssue(ctx, g.owner, g.repo, pr.GetNumber(), []string{"resizer/managed", fmt.Sprintf("resizer/ns:%s", namespace)})
+	if err != nil {
+		// Log error but don't fail the whole flow
+		fmt.Printf("Failed to add labels: %v\n", err)
+	}
+
+	return pr.GetNumber(), nil
+}
+
+func (g *GitHubProvider) UpdatePR(ctx context.Context, prID int, quotaName, namespace string, newLimits map[corev1.ResourceName]resource.Quantity) error {
+	// 1. Get PR to find the branch
+	pr, _, err := g.client.PullRequests.Get(ctx, g.owner, g.repo, prID)
+	if err != nil {
+		return err
+	}
+
+	branchName := pr.Head.GetRef()
+
+	// 2. Find file again
+	basePath := fmt.Sprintf("managed-resources/%s/%s", g.clusterName, namespace)
+	targetFile, fileContent, err := g.findQuotaFile(ctx, basePath, branchName, quotaName)
+	if err != nil {
+		return err
+	}
+
+	content, err := fileContent.GetContent()
+	if err != nil {
+		return err
+	}
+
+	// 3. Apply new changes
+	newContent := applyChangesToYaml(content, newLimits)
+
+	// Check if content actually changed to avoid empty commits
+	if newContent == content {
+		return nil
+	}
+
+	// 4. Commit update
+	opts := &github.RepositoryContentFileOptions{
+		Message:   github.String(fmt.Sprintf("chore(%s): update quota resize %s", namespace, quotaName)),
+		Content:   []byte(newContent),
+		SHA:       fileContent.SHA,
+		Branch:    github.String(branchName),
+		Committer: &github.CommitAuthor{Name: github.String("Namespace Resizer"), Email: github.String("bot@resizer.io")},
+	}
+	_, _, err = g.client.Repositories.UpdateFile(ctx, g.owner, g.repo, targetFile, opts)
+
+	return err
+}
+
+func (g *GitHubProvider) findQuotaFile(ctx context.Context, basePath, ref, quotaName string) (string, *github.RepositoryContent, error) {
+	// List files in directory
+	_, dirContent, _, err := g.client.Repositories.GetContents(ctx, g.owner, g.repo, basePath, &github.RepositoryContentGetOptions{Ref: ref})
+	if err != nil {
+		return "", nil, err
+	}
+
+	for _, file := range dirContent {
+		if file.GetType() != "file" {
+			continue
+		}
+		if !strings.HasSuffix(file.GetName(), ".yaml") && !strings.HasSuffix(file.GetName(), ".yml") {
+			continue
+		}
+
+		// Read file content to check if it contains the Quota
+		fc, _, _, err := g.client.Repositories.GetContents(ctx, g.owner, g.repo, file.GetPath(), &github.RepositoryContentGetOptions{Ref: ref})
+		if err != nil {
+			continue
+		}
+
+		content, err := fc.GetContent()
+		if err != nil {
+			continue
+		}
+
+		// Simple check: Does it contain "kind: ResourceQuota" and "name: <quotaName>"?
+		// This is a heuristic. A proper YAML parser would be better.
+		if strings.Contains(content, "kind: ResourceQuota") && strings.Contains(content, fmt.Sprintf("name: %s", quotaName)) {
+			return file.GetPath(), fc, nil
+		}
+	}
+
+	return "", nil, fmt.Errorf("quota %s not found in %s", quotaName, basePath)
+}
+
+// Helper functions
+
+func generatePRBody(ns, quota string, limits map[corev1.ResourceName]resource.Quantity) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("### Quota Resize Recommendation for `%s` in `%s`\n\n", quota, ns))
+	sb.WriteString("The Namespace Resizer Controller detected a need to increase the following limits:\n\n")
+	sb.WriteString("| Resource | New Limit |\n")
+	sb.WriteString("| :--- | :--- |\n")
+	for res, qty := range limits {
+		sb.WriteString(fmt.Sprintf("| %s | %s |\n", res, qty.String()))
+	}
+	sb.WriteString("\n\n*Generated automatically by Namespace Resizer*")
+	return sb.String()
+}
+
+func applyChangesToYaml(content string, limits map[corev1.ResourceName]resource.Quantity) string {
+	// Very naive implementation for MVP.
+	// In production, use a YAML AST parser (like go-yaml/v3) to preserve comments.
+	// Here we just look for "cpu: <value>" and replace it.
+
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		for res, qty := range limits {
+			// Check if line contains resource key (e.g. "cpu:")
+			// This is fragile but works for the demo if the format is standard.
+			if strings.Contains(line, fmt.Sprintf("%s:", res)) {
+				// Replace the value
+				// Assume format "  cpu: 1000m"
+				parts := strings.Split(line, ":")
+				if len(parts) == 2 {
+					// Keep indentation
+					indent := parts[0]
+					lines[i] = fmt.Sprintf("%s: %s", indent, qty.String())
+				}
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
+}
