@@ -141,11 +141,6 @@ func main() {
 	// If the certificate is not specified, controller-runtime will automatically
 	// generate self-signed certificates for the metrics server. While convenient for development and testing,
 	// this setup is not recommended for production.
-	//
-	// TODO(user): If you enable certManager, uncomment the following lines:
-	// - [METRICS-WITH-CERTS] at config/default/kustomization.yaml to generate and use certificates
-	// managed by cert-manager for the metrics server.
-	// - [PROMETHEUS-WITH-CERTS] at config/prometheus/kustomization.yaml for TLS certification.
 	if len(metricsCertPath) > 0 {
 		setupLog.Info("Initializing metrics certificate watcher using provided certificates",
 			"metrics-cert-path", metricsCertPath, "metrics-cert-name", metricsCertName, "metrics-cert-key", metricsCertKey)
@@ -194,14 +189,38 @@ func main() {
 	githubInstallID := os.Getenv("GITHUB_INSTALLATION_ID")
 	githubPrivateKey := os.Getenv("GITHUB_PRIVATE_KEY")
 
+	var appID, installID int64
+	if githubAppID != "" {
+		var err error
+		appID, err = strconv.ParseInt(githubAppID, 10, 64)
+		if err != nil {
+			setupLog.Error(err, "invalid GITHUB_APP_ID")
+			os.Exit(1)
+		}
+	}
+	if githubInstallID != "" {
+		var err error
+		installID, err = strconv.ParseInt(githubInstallID, 10, 64)
+		if err != nil {
+			setupLog.Error(err, "invalid GITHUB_INSTALLATION_ID")
+			os.Exit(1)
+		}
+	}
+
 	var gitProvider git.Provider
 	var errProvider error
 
-	if githubAppID != "" && githubInstallID != "" && githubPrivateKey != "" {
+	if appID != 0 && installID != 0 && githubPrivateKey != "" {
 		setupLog.Info("Using GitHub App authentication")
-		appID, _ := strconv.ParseInt(githubAppID, 10, 64)
-		installID, _ := strconv.ParseInt(githubInstallID, 10, 64)
-		gitProvider, errProvider = git.NewGitHubAppProvider(appID, installID, []byte(githubPrivateKey), githubOwner, githubRepo, clusterName, gitPathTemplate)
+		gitProvider, errProvider = git.NewGitHubAppProvider(
+			appID,
+			installID,
+			[]byte(githubPrivateKey),
+			githubOwner,
+			githubRepo,
+			clusterName,
+			gitPathTemplate,
+		)
 		if errProvider != nil {
 			setupLog.Error(errProvider, "failed to create GitHub App provider")
 			os.Exit(1)
@@ -210,7 +229,8 @@ func main() {
 		setupLog.Info("Using GitHub Token authentication")
 		gitProvider = git.NewGitHubProvider(githubToken, githubOwner, githubRepo, clusterName, gitPathTemplate)
 	} else {
-		setupLog.Error(nil, "GitHub configuration missing. Provide either GITHUB_TOKEN or GITHUB_APP_ID/INSTALLATION_ID/PRIVATE_KEY")
+		setupLog.Error(nil, "GitHub configuration missing. "+
+			"Provide either GITHUB_TOKEN or GITHUB_APP_ID/INSTALLATION_ID/PRIVATE_KEY")
 		os.Exit(1)
 	}
 

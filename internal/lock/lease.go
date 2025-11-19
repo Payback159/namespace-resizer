@@ -160,7 +160,7 @@ func (l *LeaseLocker) CheckCooldown(ctx context.Context, targetNS, quotaName str
 	}
 
 	// Check if AcquireTime + Duration > Now
-	expiry := lease.Spec.AcquireTime.Time.Add(duration)
+	expiry := lease.Spec.AcquireTime.Add(duration)
 	if time.Now().Before(expiry) {
 		return true, nil
 	}

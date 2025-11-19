@@ -1,8 +1,29 @@
-# namespace-resizer
-// TODO(user): Add simple overview of use/purpose
+# Namespace Resizer
+
+The **Namespace Resizer** is a Kubernetes controller that automatically monitors and adjusts `ResourceQuota` limits based on actual usage and "FailedCreate" events (bursts). It follows a **GitOps-first** approach, creating Pull Requests for quota changes instead of applying them directly (configurable).
 
 ## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+
+Managing ResourceQuotas in Kubernetes is often a manual and reactive process. Teams run into quotas, deployments fail, and platform engineers have to manually increase limits.
+
+The Namespace Resizer solves this by:
+1.  **Monitoring Usage:** Continuously checks `used / hard` ratio of ResourceQuotas.
+2.  **Detecting Bursts:** Listens for `FailedCreate` events caused by quota limits (e.g., during rolling updates or scaling).
+3.  **Calculating Recommendations:** Proposes new limits based on configurable thresholds and increment factors.
+4.  **GitOps Integration:** Creates Pull Requests (GitHub) with the recommended changes, allowing for review and audit trails.
+5.  **Safety First:** Includes "Cooldown" periods and "Locking" mechanisms to prevent flapping and race conditions.
+
+## Features
+
+*   **Metric-based Resizing:** Increases quota when usage > X% (default 80%).
+*   **Event-based Resizing:** Reacts immediately to denied pods due to quota.
+*   **Generic Resource Support:** Works for CPU, Memory, Storage, and custom resources.
+*   **Configurable:** Fine-tune thresholds and increments via Namespace Annotations.
+*   **GitOps Workflow:** Automates the "Request" part of Quota management.
+
+## Configuration
+
+See [INSTALLATION.md](docs/INSTALLATION.md) for detailed installation and configuration instructions.
 
 ## Getting Started
 
@@ -111,7 +132,15 @@ previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml
 is manually re-applied afterwards.
 
 ## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
+## Contributing
+
+Contributions are welcome! Please check `docs/TODO.md` for open tasks.
+
+1.  Fork the Project
+2.  Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
+3.  Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
+4.  Push to the Branch (`git push origin feature/AmazingFeature`)
+5.  Open a Pull Request
 
 **NOTE:** Run `make help` for more information on all potential `make` targets
 

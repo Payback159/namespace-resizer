@@ -41,7 +41,7 @@ func NewGitHubProvider(token, owner, repo, clusterName, pathTmpl string) *GitHub
 		&oauth2.Token{AccessToken: token},
 	)
 	tc := oauth2.NewClient(context.Background(), ts)
-	
+
 	tmpl := template.Must(template.New("path").Parse(pathTmpl))
 
 	return &GitHubProvider{
