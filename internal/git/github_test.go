@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"text/template"
 
 	"github.com/google/go-github/v60/github"
 	. "github.com/onsi/gomega"
@@ -82,9 +83,10 @@ func TestGetPRStatus(t *testing.T) {
 	client.UploadURL = url
 
 	provider := &GitHubProvider{
-		client: client,
-		owner:  "o",
-		repo:   "r",
+		client:       client,
+		owner:        "o",
+		repo:         "r",
+		pathTemplate: nil, // Not used here
 	}
 
 	// Test Open PR
@@ -157,18 +159,21 @@ func TestCreatePR(t *testing.T) {
 	client.BaseURL = url
 	client.UploadURL = url
 
+	tmpl := template.Must(template.New("path").Parse("managed-resources/{{ .Cluster }}/{{ .Namespace }}"))
+
 	provider := &GitHubProvider{
-		client:      client,
-		owner:       "o",
-		repo:        "r",
-		clusterName: "cluster",
+		client:       client,
+		owner:        "o",
+		repo:         "r",
+		clusterName:  "cluster",
+		pathTemplate: tmpl,
 	}
 
 	limits := map[corev1.ResourceName]resource.Quantity{
 		corev1.ResourceRequestsCPU: resource.MustParse("2"),
 	}
 
-	prID, err := provider.CreatePR(context.TODO(), "my-quota", "default", limits)
+	prID, err := provider.CreatePR(context.TODO(), "my-quota", "default", nil, limits)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(prID).To(Equal(101))
 }
@@ -209,17 +214,20 @@ func TestUpdatePR(t *testing.T) {
 	client.BaseURL = url
 	client.UploadURL = url
 
+	tmpl := template.Must(template.New("path").Parse("managed-resources/{{ .Cluster }}/{{ .Namespace }}"))
+
 	provider := &GitHubProvider{
-		client:      client,
-		owner:       "o",
-		repo:        "r",
-		clusterName: "cluster",
+		client:       client,
+		owner:        "o",
+		repo:         "r",
+		clusterName:  "cluster",
+		pathTemplate: tmpl,
 	}
 
 	limits := map[corev1.ResourceName]resource.Quantity{
 		corev1.ResourceRequestsCPU: resource.MustParse("2"),
 	}
 
-	err := provider.UpdatePR(context.TODO(), 101, "my-quota", "default", limits)
+	err := provider.UpdatePR(context.TODO(), 101, "my-quota", "default", nil, limits)
 	g.Expect(err).ToNot(HaveOccurred())
 }

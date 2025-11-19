@@ -1,10 +1,12 @@
 package git
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
 	"strings"
+	"text/template"
 	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
@@ -16,8 +18,8 @@ import (
 
 type Provider interface {
 	GetPRStatus(ctx context.Context, prID int) (*PRStatus, error)
-	CreatePR(ctx context.Context, quotaName, namespace string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error)
-	UpdatePR(ctx context.Context, prID int, quotaName, namespace string, newLimits map[corev1.ResourceName]resource.Quantity) error
+	CreatePR(ctx context.Context, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error)
+	UpdatePR(ctx context.Context, prID int, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) error
 }
 
 type PRStatus struct {
@@ -27,37 +29,70 @@ type PRStatus struct {
 }
 
 type GitHubProvider struct {
-	client      *github.Client
-	owner       string
-	repo        string
-	clusterName string
+	client       *github.Client
+	owner        string
+	repo         string
+	clusterName  string
+	pathTemplate *template.Template
 }
 
-func NewGitHubProvider(token, owner, repo, clusterName string) *GitHubProvider {
+func NewGitHubProvider(token, owner, repo, clusterName, pathTmpl string) *GitHubProvider {
 	ts := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: token},
 	)
 	tc := oauth2.NewClient(context.Background(), ts)
+	
+	tmpl := template.Must(template.New("path").Parse(pathTmpl))
+
 	return &GitHubProvider{
-		client:      github.NewClient(tc),
-		owner:       owner,
-		repo:        repo,
-		clusterName: clusterName,
+		client:       github.NewClient(tc),
+		owner:        owner,
+		repo:         repo,
+		clusterName:  clusterName,
+		pathTemplate: tmpl,
 	}
 }
 
-func NewGitHubAppProvider(appID, installationID int64, privateKey []byte, owner, repo, clusterName string) (*GitHubProvider, error) {
+func NewGitHubAppProvider(appID, installationID int64, privateKey []byte, owner, repo, clusterName, pathTmpl string) (*GitHubProvider, error) {
 	itr, err := ghinstallation.New(http.DefaultTransport, appID, installationID, privateKey)
 	if err != nil {
 		return nil, err
 	}
 
+	tmpl, err := template.New("path").Parse(pathTmpl)
+	if err != nil {
+		return nil, err
+	}
+
 	return &GitHubProvider{
-		client:      github.NewClient(&http.Client{Transport: itr}),
-		owner:       owner,
-		repo:        repo,
-		clusterName: clusterName,
+		client:       github.NewClient(&http.Client{Transport: itr}),
+		owner:        owner,
+		repo:         repo,
+		clusterName:  clusterName,
+		pathTemplate: tmpl,
 	}, nil
+}
+
+func (g *GitHubProvider) resolvePath(namespace string, annotations map[string]string) (string, error) {
+	// 1. Check Annotation Override
+	if val, ok := annotations["resizer.io/git-path"]; ok {
+		return val, nil
+	}
+
+	// 2. Use Template
+	data := struct {
+		Cluster   string
+		Namespace string
+	}{
+		Cluster:   g.clusterName,
+		Namespace: namespace,
+	}
+
+	var buf bytes.Buffer
+	if err := g.pathTemplate.Execute(&buf, data); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }
 
 func (g *GitHubProvider) GetPRStatus(ctx context.Context, prID int) (*PRStatus, error) {
@@ -72,7 +107,7 @@ func (g *GitHubProvider) GetPRStatus(ctx context.Context, prID int) (*PRStatus, 
 	}, nil
 }
 
-func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error) {
+func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error) {
 	// 1. Get default branch ref
 	repo, _, err := g.client.Repositories.Get(ctx, g.owner, g.repo)
 	if err != nil {
@@ -97,9 +132,10 @@ func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace stri
 	}
 
 	// 3. Find the file
-	// Path convention: managed-resources/<cluster-name>/<namespace>/
-	// We need to find a file that contains the ResourceQuota definition.
-	basePath := fmt.Sprintf("managed-resources/%s/%s", g.clusterName, namespace)
+	basePath, err := g.resolvePath(namespace, annotations)
+	if err != nil {
+		return 0, fmt.Errorf("failed to resolve path: %w", err)
+	}
 
 	targetFile, fileContent, err := g.findQuotaFile(ctx, basePath, branchName, quotaName)
 	if err != nil {
@@ -151,7 +187,7 @@ func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace stri
 	return pr.GetNumber(), nil
 }
 
-func (g *GitHubProvider) UpdatePR(ctx context.Context, prID int, quotaName, namespace string, newLimits map[corev1.ResourceName]resource.Quantity) error {
+func (g *GitHubProvider) UpdatePR(ctx context.Context, prID int, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) error {
 	// 1. Get PR to find the branch
 	pr, _, err := g.client.PullRequests.Get(ctx, g.owner, g.repo, prID)
 	if err != nil {
@@ -161,7 +197,11 @@ func (g *GitHubProvider) UpdatePR(ctx context.Context, prID int, quotaName, name
 	branchName := pr.Head.GetRef()
 
 	// 2. Find file again
-	basePath := fmt.Sprintf("managed-resources/%s/%s", g.clusterName, namespace)
+	basePath, err := g.resolvePath(namespace, annotations)
+	if err != nil {
+		return err
+	}
+
 	targetFile, fileContent, err := g.findQuotaFile(ctx, basePath, branchName, quotaName)
 	if err != nil {
 		return err

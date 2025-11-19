@@ -170,7 +170,7 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			if needsResize {
 				// Update if needed
 				logger.Info("PR is open, updating if needed", "prID", prID)
-				if err := r.GitProvider.UpdatePR(ctx, prID, quota.Name, req.Namespace, recommendations); err != nil {
+				if err := r.GitProvider.UpdatePR(ctx, prID, quota.Name, req.Namespace, ns.Annotations, recommendations); err != nil {
 					logger.Error(err, "failed to update PR")
 					return ctrl.Result{}, err
 				}
@@ -205,7 +205,7 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 
 		logger.Info("No lock found, creating PR")
-		newPRID, err := r.GitProvider.CreatePR(ctx, quota.Name, req.Namespace, recommendations)
+		newPRID, err := r.GitProvider.CreatePR(ctx, quota.Name, req.Namespace, ns.Annotations, recommendations)
 		if err != nil {
 			logger.Error(err, "failed to create PR")
 			return ctrl.Result{}, err

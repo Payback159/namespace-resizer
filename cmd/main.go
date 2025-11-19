@@ -183,6 +183,11 @@ func main() {
 	githubOwner := os.Getenv("GITHUB_OWNER")
 	githubRepo := os.Getenv("GITHUB_REPO")
 	clusterName := os.Getenv("CLUSTER_NAME")
+	gitPathTemplate := os.Getenv("GIT_PATH_TEMPLATE")
+
+	if gitPathTemplate == "" {
+		gitPathTemplate = "managed-resources/{{ .Cluster }}/{{ .Namespace }}"
+	}
 
 	// GitHub App Config
 	githubAppID := os.Getenv("GITHUB_APP_ID")
@@ -196,14 +201,14 @@ func main() {
 		setupLog.Info("Using GitHub App authentication")
 		appID, _ := strconv.ParseInt(githubAppID, 10, 64)
 		installID, _ := strconv.ParseInt(githubInstallID, 10, 64)
-		gitProvider, errProvider = git.NewGitHubAppProvider(appID, installID, []byte(githubPrivateKey), githubOwner, githubRepo, clusterName)
+		gitProvider, errProvider = git.NewGitHubAppProvider(appID, installID, []byte(githubPrivateKey), githubOwner, githubRepo, clusterName, gitPathTemplate)
 		if errProvider != nil {
 			setupLog.Error(errProvider, "failed to create GitHub App provider")
 			os.Exit(1)
 		}
 	} else if githubToken != "" {
 		setupLog.Info("Using GitHub Token authentication")
-		gitProvider = git.NewGitHubProvider(githubToken, githubOwner, githubRepo, clusterName)
+		gitProvider = git.NewGitHubProvider(githubToken, githubOwner, githubRepo, clusterName, gitPathTemplate)
 	} else {
 		setupLog.Error(nil, "GitHub configuration missing. Provide either GITHUB_TOKEN or GITHUB_APP_ID/INSTALLATION_ID/PRIVATE_KEY")
 		os.Exit(1)
