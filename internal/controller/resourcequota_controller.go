@@ -26,8 +26,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	resizerConfig "github.com/payback159/namespace-resizer/internal/config"
 	"github.com/payback159/namespace-resizer/internal/git"
 	"github.com/payback159/namespace-resizer/internal/lock"
 )
@@ -46,10 +47,11 @@ import (
 // ResourceQuotaReconciler reconciles a ResourceQuota object
 type ResourceQuotaReconciler struct {
 	client.Client
-	Scheme      *runtime.Scheme
-	Recorder    record.EventRecorder
-	GitProvider git.Provider
-	Locker      *lock.LeaseLocker
+	Scheme          *runtime.Scheme
+	Recorder        record.EventRecorder
+	GitProvider     git.Provider
+	Locker          *lock.LeaseLocker
+	EnableAutoMerge bool
 }
 
 type ResizerConfig struct {
@@ -63,11 +65,15 @@ type ResizerConfig struct {
 // +kubebuilder:rbac:groups=core,resources=resourcequotas/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;list;watch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments;replicasets;statefulsets;daemonsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=jobs;cronjobs,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	logger.Info("Reconciling ResourceQuota", "name", req.Name, "namespace", req.Namespace)
 
 	// 1. Fetch ResourceQuota
 	var quota corev1.ResourceQuota
@@ -161,24 +167,46 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if !status.IsOpen {
 			// PR is merged or closed -> Release Lock
 			logger.Info("PR is closed/merged, releasing lock", "prID", prID)
+
+			// If merged, set LastModified (which starts cooldown and deduplicates events)
+			if status.IsMerged {
+				logger.Info("PR merged, updating last-modified timestamp", "timestamp", time.Now())
+				if err := r.Locker.SetLastModified(ctx, req.Namespace, quota.Name, time.Now()); err != nil {
+					logger.Error(err, "failed to set last-modified timestamp")
+				}
+			}
+
 			if err := r.Locker.ReleaseLock(ctx, req.Namespace, quota.Name); err != nil {
 				logger.Error(err, "failed to release lock")
 				return ctrl.Result{}, err
-			}
-
-			// If merged, set Cooldown
-			if status.IsMerged {
-				logger.Info("PR merged, setting cooldown", "duration", config.Cooldown)
-				if err := r.Locker.SetCooldown(ctx, req.Namespace, quota.Name); err != nil {
-					logger.Error(err, "failed to set cooldown")
-					// Don't fail reconcile, just log
-				}
 			}
 
 			// Requeue to start fresh
 			return ctrl.Result{Requeue: true}, nil
 		} else {
 			// PR is open
+
+			// Auto-Merge Logic
+			shouldAutoMerge := r.EnableAutoMerge
+			if val, ok := ns.Annotations[resizerConfig.AnnotationAutoMerge]; ok && val == "false" {
+				shouldAutoMerge = false
+			}
+
+			if shouldAutoMerge {
+				if status.Mergeable && status.MergeableState == "clean" {
+					logger.Info("Auto-merging PR", "prID", prID)
+					if err := r.GitProvider.MergePR(ctx, prID, "squash"); err != nil {
+						logger.Error(err, "failed to auto-merge PR")
+					} else {
+						// Merged successfully!
+						// Requeue to handle post-merge logic (release lock, set cooldown)
+						return ctrl.Result{Requeue: true}, nil
+					}
+				} else {
+					logger.Info("Auto-merge enabled but PR not ready", "mergeable", status.Mergeable, "state", status.MergeableState)
+				}
+			}
+
 			if needsResize {
 				// Update if needed
 				logger.Info("PR is open, updating if needed", "prID", prID)
@@ -242,12 +270,23 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 }
 
 func (r *ResourceQuotaReconciler) analyzeEvents(ctx context.Context, quota corev1.ResourceQuota, config ResizerConfig) (map[corev1.ResourceName]resource.Quantity, error) {
+	logger := log.FromContext(ctx)
 	recommendations := make(map[corev1.ResourceName]resource.Quantity)
 
 	// List events in the namespace
 	var eventList corev1.EventList
 	if err := r.List(ctx, &eventList, client.InNamespace(quota.Namespace)); err != nil {
 		return nil, err
+	}
+
+	// Get LastModified to filter old events (Deduplication)
+	lastMod, err := r.Locker.GetLastModified(ctx, quota.Namespace, quota.Name)
+	if err != nil {
+		// Log error but continue, assuming no last modified (process all events)
+		// We don't have a logger here easily, but we can ignore or return error.
+		// Returning error might be safer to avoid double counting if DB is down.
+		// return nil, fmt.Errorf("failed to get last modified time: %w", err)
+		logger.Error(err, "failed to get last modified time")
 	}
 
 	// Look for recent FailedCreate events mentioning this quota
@@ -261,9 +300,15 @@ func (r *ResourceQuotaReconciler) analyzeEvents(ctx context.Context, quota corev
 		if evt.LastTimestamp.Time.Before(cutoff) {
 			continue
 		}
+		// Deduplication: Ignore events that happened before the last successful resize
+		if !lastMod.IsZero() && evt.LastTimestamp.Time.Before(lastMod) {
+			continue
+		}
+
 		if evt.Type != corev1.EventTypeWarning || evt.Reason != "FailedCreate" {
 			continue
 		}
+
 		if !strings.Contains(evt.Message, "exceeded quota") || !strings.Contains(evt.Message, quota.Name) {
 			continue
 		}
@@ -271,6 +316,7 @@ func (r *ResourceQuotaReconciler) analyzeEvents(ctx context.Context, quota corev
 		// 1. Parse Message
 		resName, reqQty, err := parseEventMessage(evt.Message)
 		if err != nil {
+			logger.Error(err, "Failed to parse event message", "message", evt.Message)
 			continue
 		}
 
@@ -348,10 +394,12 @@ func parseEventMessage(message string) (corev1.ResourceName, resource.Quantity, 
 }
 
 func (r *ResourceQuotaReconciler) isObjectAlive(ctx context.Context, ref corev1.ObjectReference, namespace string) bool {
+	logger := log.FromContext(ctx)
 	// Construct Unstructured object to query API
 	u := &unstructured.Unstructured{}
 	gv, err := schema.ParseGroupVersion(ref.APIVersion)
 	if err != nil {
+		logger.Error(err, "Failed to parse GroupVersion", "apiVersion", ref.APIVersion)
 		// Fallback: try to guess or just fail safe (assume not alive if we can't parse)
 		// But APIVersion should be valid in Event.
 		return false
@@ -360,18 +408,8 @@ func (r *ResourceQuotaReconciler) isObjectAlive(ctx context.Context, ref corev1.
 
 	key := types.NamespacedName{Name: ref.Name, Namespace: namespace}
 	if err := r.Get(ctx, key, u); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false
-		}
-		// On other errors (e.g. API down), we assume false to be safe and avoid over-provisioning
 		return false
 	}
-
-	// Verify UID matches to ensure it's the exact same object instance
-	if u.GetUID() != ref.UID {
-		return false
-	}
-
 	return true
 }
 

@@ -95,8 +95,18 @@ Zusätzlich zum Monitoring der `ResourceQuota`-Objekte überwacht der Controller
     *   *Erkenntnis:* Wir brauchen 5 CPUs, haben aber nur noch 2 frei (10-8). Defizit = 3 CPUs.
 3.  **Reaktion (Deficit-Filling):**
     Statt der Standard-Erhöhung (z.B. 20%) wird berechnet, was *mindestens* nötig ist.
-    $$ \text{NewLimit} = \text{CurrentLimit} + \max(\text{StandardIncrement}, \text{Deficit} + \text{Buffer}) $$
-    *   Damit wird sichergestellt, dass das Limit sofort so weit angehoben wird, dass das Deployment durchgeht.
+### 2.7. Event Deduplication & Stale Events
+
+Ein kritisches Problem bei Event-Driven Resizing ist das "Double Counting" von alten Events.
+*Szenario:* Ein Deployment failt (Event A). Der Controller erhöht das Quota. Das Deployment startet. Der Cooldown läuft ab. Das Event A existiert aber immer noch (K8s Events leben standardmäßig 1h). Der Controller würde beim nächsten Lauf Event A erneut sehen und fälschlicherweise denken, es gäbe immer noch ein Problem.
+
+**Lösung: Last-Modified Timestamp in Persistent Lease**
+Der Controller speichert den Zeitpunkt der letzten erfolgreichen Änderung (PR Erstellung oder Merge) im **State-Objekt (Lease)** des Controllers (siehe 3.3).
+
+*   **Speicherort:** Annotation `resizer.io/last-modified` am `Lease` Objekt im `namespace-resizer-system` Namespace.
+*   **Logik:** Bei der Analyse von Events werden alle Events ignoriert, deren `LastTimestamp` **älter** ist als `resizer.io/last-modified`.
+
+Damit wird sichergestellt, dass jedes Event nur genau einmal zu einer Aktion führt.
 
 ## 3. GitOps Kompatibilität & Ausführungs-Strategie
 
@@ -125,37 +135,47 @@ Anstatt das Quota im Cluster "schmutzig" zu patchen (was zu Konflikten mit ArgoC
 
 *Hinweis:* Die Strategie "Direct Patch" (ehemals Strategie A) wird übersprungen, um die GitOps-Prinzipien nicht zu verletzen.
 
-### 3.3. Handling Async Latency (Stateful Locking via Kubernetes Leases)
+### 3.3. State Management & Locking (Persistent Leases)
 
-Um zu verhindern, dass der Controller während der Bearbeitungszeit eines Pull Requests (PR) ständig neue PRs erstellt, benötigen wir einen Locking-Mechanismus.
+Wir benötigen einen Mechanismus für zwei Dinge:
+1.  **Locking:** Verhindern, dass wir mehrere PRs gleichzeitig für denselben Namespace öffnen.
+2.  **State:** Speichern, wann wir zuletzt agiert haben (für Event Deduplication), da wir das Quota-Objekt selbst nicht verändern können (GitOps Sync würde es überschreiben).
+
 Wir nutzen dazu native Kubernetes `Lease` Objekte (`coordination.k8s.io/v1`).
 
 **Speicherort:**
-Die Leases werden im **Namespace des Controllers** (z.B. `namespace-resizer-system`) gespeichert, nicht im Ziel-Namespace.
+Die Leases werden im **Namespace des Controllers** (z.B. `namespace-resizer-system`) gespeichert.
 *Grund:* GitOps-Tools (ArgoCD/Flux) würden Leases im Ziel-Namespace löschen ("Pruning"), da sie nicht im Git definiert sind.
 
 **Namenskonvention:**
-`lock-<target-namespace>-<quota-name>`
+`state-<target-namespace>-<quota-name>`
 
 **Workflow:**
 
 1.  **Check (Local):**
-    Der Controller prüft bei Handlungsbedarf zuerst, ob eine passende `Lease` im Controller-Namespace existiert.
+    Der Controller lädt die Lease für das Ziel-Quota.
 
-2.  **Fall A: Lease existiert (Lock aktiv)**
-    *   Der Controller liest die PR-ID aus der Lease (z.B. via Annotation oder `holderIdentity`).
-    *   **GitHub Check:** Gezielter API-Call zum Status dieses *einen* PRs.
-        *   *PR ist offen:* Prüfe, ob der neue Bedarf höher ist als im PR. Falls ja -> Update PR. Falls nein -> Warten.
-        *   *PR ist gemerged/closed:* Der Lock ist veraltet. Lösche die Lease. -> Neustart des Zyklus.
+2.  **Fall A: Lease hat Holder (Lock aktiv)**
+    *   Wir warten (oder aktualisieren den PR, siehe 3.4).
 
-3.  **Fall B: Keine Lease (Lock frei)**
-    *   Der Controller erstellt einen neuen Pull Request in GitHub.
-    *   Der Controller erstellt eine `Lease` im Controller-Namespace und speichert die PR-URL/ID darin.
+3.  **Fall B: Lease hat keinen Holder (Lock frei)**
+    *   Wir prüfen `Annotations["resizer.io/last-modified"]`.
+    *   Sind die Events neuer als dieser Timestamp?
+        *   **Ja:** Wir übernehmen den Lock (setzen `HolderIdentity`), erstellen PR, aktualisieren Timestamp.
+        *   **Nein:** Wir ignorieren die Events (altes Problem).
 
-**Vorteil:**
-*   **Performance:** Spart teure "List PRs" Calls gegen die GitHub API.
-*   **Stabilität:** Der Status "Wir arbeiten gerade an Namespace X" liegt im Cluster.
-*   **GitOps-Safe:** Da die Leases im System-Namespace liegen, werden sie nicht vom GitOps-Sync des App-Teams gelöscht.
+**Wichtig:** Die Lease wird **nicht gelöscht**, wenn der PR gemerged ist. Wir entfernen nur die `HolderIdentity` (Unlock), damit der State (Timestamp) erhalten bleibt.
+
+### 3.3.1. Garbage Collection (Lease Cleanup)
+
+Da wir für jeden Namespace ein persistentes Lease-Objekt im Controller-Namespace anlegen, könnten sich über die Zeit "verwaiste" Leases ansammeln (z.B. wenn ein Namespace gelöscht wird). Um die Kubernetes API sauber zu halten, implementiert der Controller eine Garbage Collection Routine.
+
+**Mechanismus:**
+*   Ein Hintergrund-Prozess (Goroutine) läuft periodisch (z.B. alle 12 Stunden).
+*   Er listet alle Leases im Controller-Namespace, die das Label `app.kubernetes.io/managed-by=namespace-resizer` tragen.
+*   Er extrahiert den Ziel-Namespace aus dem Lease-Namen.
+*   Er prüft, ob der Ziel-Namespace im Cluster noch existiert.
+*   Falls der Namespace nicht mehr existiert, wird das Lease-Objekt gelöscht.
 
 ### 3.4. Auto-Merge Strategie
 

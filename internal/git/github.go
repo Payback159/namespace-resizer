@@ -21,14 +21,16 @@ var ErrFileNotFound = errors.New("file not found")
 
 type Provider interface {
 	GetPRStatus(ctx context.Context, prID int) (*PRStatus, error)
+	MergePR(ctx context.Context, prID int, method string) error
 	CreatePR(ctx context.Context, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error)
 	UpdatePR(ctx context.Context, prID int, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) error
 }
 
 type PRStatus struct {
-	IsOpen   bool
-	IsMerged bool
-	// We could store current proposed limits here to compare
+	IsOpen         bool
+	IsMerged       bool
+	Mergeable      bool
+	MergeableState string
 }
 
 type GitHubProvider struct {
@@ -105,9 +107,21 @@ func (g *GitHubProvider) GetPRStatus(ctx context.Context, prID int) (*PRStatus, 
 	}
 
 	return &PRStatus{
-		IsOpen:   pr.GetState() == "open",
-		IsMerged: pr.GetMerged(),
+		IsOpen:         pr.GetState() == "open",
+		IsMerged:       pr.GetMerged(),
+		Mergeable:      pr.GetMergeable(),
+		MergeableState: pr.GetMergeableState(),
 	}, nil
+}
+
+func (g *GitHubProvider) MergePR(ctx context.Context, prID int, method string) error {
+	if method == "" {
+		method = "squash"
+	}
+	_, _, err := g.client.PullRequests.Merge(ctx, g.owner, g.repo, prID, "Auto-merge by Namespace Resizer", &github.PullRequestOptions{
+		MergeMethod: method,
+	})
+	return err
 }
 
 func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error) {

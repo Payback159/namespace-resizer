@@ -21,6 +21,7 @@ import (
 	"flag"
 	"os"
 	"strconv"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -39,6 +40,10 @@ import (
 	"github.com/payback159/namespace-resizer/internal/controller"
 	"github.com/payback159/namespace-resizer/internal/git"
 	"github.com/payback159/namespace-resizer/internal/lock"
+
+	coordinationv1 "k8s.io/api/coordination/v1"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -62,6 +67,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var enableAutoMerge bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -80,6 +86,8 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.BoolVar(&enableAutoMerge, "enable-auto-merge", os.Getenv("ENABLE_AUTO_MERGE") == "true",
+		"If set, the controller will automatically merge Pull Requests if checks pass.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -157,6 +165,15 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "be3fb48b.resizer.io",
+		Cache: cache.Options{
+			ByObject: map[client.Object]cache.ByObject{
+				&coordinationv1.Lease{}: {
+					Namespaces: map[string]cache.Config{
+						lock.ControllerNamespace: {},
+					},
+				},
+			},
+		},
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -210,7 +227,11 @@ func main() {
 	var gitProvider git.Provider
 	var errProvider error
 
-	if appID != 0 && installID != 0 && githubPrivateKey != "" {
+	// Check for Dry Run / Simulation Mode
+	if os.Getenv("DRY_RUN") == "true" {
+		setupLog.Info("Using LogOnlyProvider (Dry Run / Simulation Mode)")
+		gitProvider = git.NewStatefulLogProvider(mgr.GetClient())
+	} else if appID != 0 && installID != 0 && githubPrivateKey != "" {
 		setupLog.Info("Using GitHub App authentication")
 		gitProvider, errProvider = git.NewGitHubAppProvider(
 			appID,
@@ -230,23 +251,31 @@ func main() {
 		gitProvider = git.NewGitHubProvider(githubToken, githubOwner, githubRepo, clusterName, gitPathTemplate)
 	} else {
 		setupLog.Error(nil, "GitHub configuration missing. "+
-			"Provide either GITHUB_TOKEN or GITHUB_APP_ID/INSTALLATION_ID/PRIVATE_KEY")
+			"Provide either GITHUB_TOKEN or GITHUB_APP_ID/INSTALLATION_ID/PRIVATE_KEY, or set DRY_RUN=true")
 		os.Exit(1)
 	}
 
-	if githubOwner == "" || githubRepo == "" || clusterName == "" {
+	if (githubOwner == "" || githubRepo == "" || clusterName == "") && os.Getenv("DRY_RUN") != "true" {
 		setupLog.Error(nil, "GitHub configuration missing", "owner", githubOwner, "repo", githubRepo, "cluster", clusterName)
 		os.Exit(1)
 	}
 
 	locker := lock.NewLeaseLocker(mgr.GetClient())
 
+	// Start Lease Garbage Collector (runs every 12 hours)
+	gc := lock.NewLeaseGarbageCollector(mgr.GetClient(), 12*time.Hour)
+	if err := mgr.Add(gc); err != nil {
+		setupLog.Error(err, "unable to add lease garbage collector to manager")
+		os.Exit(1)
+	}
+
 	if err := (&controller.ResourceQuotaReconciler{
-		Client:      mgr.GetClient(),
-		Scheme:      mgr.GetScheme(),
-		Recorder:    mgr.GetEventRecorderFor("namespace-resizer"),
-		GitProvider: gitProvider,
-		Locker:      locker,
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		Recorder:        mgr.GetEventRecorderFor("namespace-resizer"),
+		GitProvider:     gitProvider,
+		Locker:          locker,
+		EnableAutoMerge: enableAutoMerge,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ResourceQuota")
 		os.Exit(1)

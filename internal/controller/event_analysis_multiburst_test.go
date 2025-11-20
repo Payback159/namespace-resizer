@@ -6,6 +6,8 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
+	"github.com/payback159/namespace-resizer/internal/lock"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,6 +22,7 @@ func TestAnalyzeEvents_MultiBurst(t *testing.T) {
 	// Setup Scheme
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
+	_ = coordinationv1.AddToScheme(scheme)
 
 	// 1. Setup Quota (Fully Used)
 	// Hard: 10, Used: 10
@@ -127,6 +130,7 @@ func TestAnalyzeEvents_MultiBurst(t *testing.T) {
 
 	r := &ResourceQuotaReconciler{
 		Client: fakeClient,
+		Locker: lock.NewLeaseLocker(fakeClient),
 	}
 
 	// Config with 0 increment to make math easy

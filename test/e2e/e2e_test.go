@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -72,6 +73,19 @@ var _ = Describe("Manager", Ordered, func() {
 		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+
+		By("configuring controller for simulation mode")
+		cmd = exec.Command("kubectl", "set", "env", "deployment/namespace-resizer-controller-manager",
+			"-n", namespace,
+			"DRY_RUN=true",
+			"ENABLE_AUTO_MERGE=true")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to set environment variables")
+
+		By("waiting for controller rollout")
+		cmd = exec.Command("kubectl", "rollout", "status", "deployment/namespace-resizer-controller-manager", "-n", namespace)
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to wait for rollout")
 	})
 
 	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
@@ -79,6 +93,10 @@ var _ = Describe("Manager", Ordered, func() {
 	AfterAll(func() {
 		By("cleaning up the curl pod for metrics")
 		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
+		_, _ = utils.Run(cmd)
+
+		By("cleaning up the metrics ClusterRoleBinding")
+		cmd = exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
 		_, _ = utils.Run(cmd)
 
 		By("undeploying the controller-manager")
@@ -175,7 +193,11 @@ var _ = Describe("Manager", Ordered, func() {
 
 		It("should ensure the metrics endpoint is serving metrics", func() {
 			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
+			// Cleanup any existing binding first
+			cmd := exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+
+			cmd = exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
 				"--clusterrole=namespace-resizer-metrics-reader",
 				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
 			)
@@ -214,6 +236,11 @@ var _ = Describe("Manager", Ordered, func() {
 
 			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
 
+			By("getting the metrics service IP")
+			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace, "-o", "jsonpath={.spec.clusterIP}")
+			serviceIP, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to get metrics service IP")
+
 			By("creating the curl-metrics pod to access the metrics endpoint")
 			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
 				"--namespace", namespace,
@@ -225,7 +252,7 @@ var _ = Describe("Manager", Ordered, func() {
 							"name": "curl",
 							"image": "curlimages/curl:latest",
 							"command": ["/bin/sh", "-c"],
-							"args": ["curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics"],
+							"args": ["curl -v -k --retry 10 --retry-delay 2 --retry-max-time 60 -H 'Authorization: Bearer %s' https://%s:8443/metrics"],
 							"securityContext": {
 								"readOnlyRootFilesystem": true,
 								"allowPrivilegeEscalation": false,
@@ -241,7 +268,7 @@ var _ = Describe("Manager", Ordered, func() {
 						}],
 						"serviceAccountName": "%s"
 					}
-				}`, token, metricsServiceName, namespace, serviceAccountName))
+				}`, token, serviceIP, serviceAccountName))
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
 
@@ -277,6 +304,109 @@ var _ = Describe("Manager", Ordered, func() {
 		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
 		//    strings.ToLower(<Kind>),
 		// ))
+	})
+
+	Context("Auto-Merge Simulation", func() {
+		const (
+			simNamespace = "e2e-simulation"
+			simQuota     = "e2e-quota"
+		)
+
+		It("should auto-resize namespace in simulation mode", func() {
+			// 1. Create Namespace
+			By("creating simulation namespace")
+			cmd := exec.Command("kubectl", "create", "ns", simNamespace)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Cleanup
+			defer func() {
+				cmd := exec.Command("kubectl", "delete", "ns", simNamespace, "--ignore-not-found")
+				_, _ = utils.Run(cmd)
+			}()
+
+			// 2. Create ResourceQuota
+			By("creating resource quota")
+			quotaYaml := `
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: e2e-quota
+  namespace: e2e-simulation
+spec:
+  hard:
+    cpu: "100m"
+    memory: "128Mi"
+`
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(quotaYaml)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			// 3. Create Burst Deployment (should fail)
+			By("creating burst deployment")
+			deploymentYaml := `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: burst-deployment
+  namespace: e2e-simulation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: burst
+  template:
+    metadata:
+      labels:
+        app: burst
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        resources:
+          requests:
+            cpu: "150m"
+            memory: "64Mi"
+`
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(deploymentYaml)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify FailedCreate event exists
+			By("verifying FailedCreate event exists")
+			Eventually(func() string {
+				cmd := exec.Command("kubectl", "get", "events", "-n", simNamespace, "--field-selector", "reason=FailedCreate")
+				out, _ := utils.Run(cmd)
+				return out
+			}, 1*time.Minute, 5*time.Second).Should(ContainSubstring("exceeded quota"))
+
+			// 4. Watch logs for "GitOps Simulation: Merging PR"
+			By("waiting for controller to simulate PR merge")
+			Eventually(func() string {
+				cmd := exec.Command("kubectl", "logs", "-l", "control-plane=controller-manager", "-n", namespace)
+				out, _ := utils.Run(cmd)
+				return out
+			}, 2*time.Minute, 5*time.Second).Should(SatisfyAny(
+				ContainSubstring("GitOps Simulation: Merging PR"),
+				ContainSubstring("StatefulLogProvider: Merged PR"),
+				ContainSubstring("PR is closed/merged"),
+			))
+
+			// 5. Simulate ArgoCD: Apply the change
+			By("simulating ArgoCD sync (patching quota)")
+			patch := `{"spec":{"hard":{"cpu":"200m"}}}`
+			cmd = exec.Command("kubectl", "patch", "resourcequota", simQuota, "-n", simNamespace, "--type=merge", "-p", patch)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			// 6. Verify Deployment becomes ready
+			By("waiting for deployment to be ready")
+			cmd = exec.Command("kubectl", "wait", "deployment/burst-deployment", "-n", simNamespace, "--for=condition=Available", "--timeout=2m")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+		})
 	})
 })
 
