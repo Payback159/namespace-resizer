@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -172,6 +173,10 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				// Update if needed
 				logger.Info("PR is open, updating if needed", "prID", prID)
 				if err := r.GitProvider.UpdatePR(ctx, prID, quota.Name, req.Namespace, ns.Annotations, recommendations); err != nil {
+					if errors.Is(err, git.ErrFileNotFound) {
+						logger.Info("Quota file not found in Git repository during update. Retrying later.", "error", err.Error())
+						return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+					}
 					logger.Error(err, "failed to update PR")
 					return ctrl.Result{}, err
 				}
@@ -208,6 +213,10 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		logger.Info("No lock found, creating PR")
 		newPRID, err := r.GitProvider.CreatePR(ctx, quota.Name, req.Namespace, ns.Annotations, recommendations)
 		if err != nil {
+			if errors.Is(err, git.ErrFileNotFound) {
+				logger.Info("Quota file not found in Git repository. Retrying later.", "error", err.Error())
+				return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+			}
 			logger.Error(err, "failed to create PR")
 			return ctrl.Result{}, err
 		}
@@ -434,7 +443,6 @@ func parseConfig(annotations map[string]string) ResizerConfig {
 				// If > 1, assume percentage? No, 2.0 means 200%.
 				// Let's stick to: if "%" suffix -> /100. If no suffix -> raw value.
 				// But for threshold "80" means 80%.
-				// Let's assume threshold is always 0-100.
 				// Increment: "0.2" = 20%. "20%" = 20%.
 				config.IncrementFactors[corev1.ResourceName(res)] = val
 			}

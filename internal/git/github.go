@@ -3,6 +3,7 @@ package git
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -248,6 +249,11 @@ func (g *GitHubProvider) findQuotaFile(ctx context.Context, basePath, ref, quota
 	// List files in directory
 	_, dirContent, _, err := g.client.Repositories.GetContents(ctx, g.owner, g.repo, basePath, &github.RepositoryContentGetOptions{Ref: ref})
 	if err != nil {
+		// Check if it's a 404
+		var ghErr *github.ErrorResponse
+		if errors.As(err, &ghErr) && ghErr.Response.StatusCode == http.StatusNotFound {
+			return "", nil, fmt.Errorf("%w: %v", ErrFileNotFound, err)
+		}
 		return "", nil, err
 	}
 
@@ -277,7 +283,7 @@ func (g *GitHubProvider) findQuotaFile(ctx context.Context, basePath, ref, quota
 		}
 	}
 
-	return "", nil, fmt.Errorf("quota %s not found in %s", quotaName, basePath)
+	return "", nil, fmt.Errorf("%w: quota %s not found in %s", ErrFileNotFound, quotaName, basePath)
 }
 
 // Helper functions
@@ -319,3 +325,5 @@ func applyChangesToYaml(content string, limits map[corev1.ResourceName]resource.
 	}
 	return strings.Join(lines, "\n")
 }
+
+var ErrFileNotFound = errors.New("file not found")
