@@ -54,6 +54,8 @@ type ResourceQuotaReconciler struct {
 	EnableAutoMerge bool
 }
 
+const defaultKey = "default"
+
 type ResizerConfig struct {
 	Thresholds       map[corev1.ResourceName]float64
 	IncrementFactors map[corev1.ResourceName]float64
@@ -499,7 +501,7 @@ func (c ResizerConfig) GetThreshold(res corev1.ResourceName) float64 {
 		}
 	}
 	// Fallback to default
-	if v, ok := c.Thresholds["default"]; ok {
+	if v, ok := c.Thresholds[defaultKey]; ok {
 		return v
 	}
 	return 80.0
@@ -524,7 +526,7 @@ func (c ResizerConfig) GetIncrement(res corev1.ResourceName) float64 {
 			return v
 		}
 	}
-	if v, ok := c.IncrementFactors["default"]; ok {
+	if v, ok := c.IncrementFactors[defaultKey]; ok {
 		return v
 	}
 	return 0.2
@@ -538,8 +540,8 @@ func parseConfig(annotations map[string]string) ResizerConfig {
 	}
 
 	// Set Defaults
-	config.Thresholds["default"] = 80.0
-	config.IncrementFactors["default"] = 0.2
+	config.Thresholds[defaultKey] = 80.0
+	config.IncrementFactors[defaultKey] = 0.2
 
 	// Helper to parse percentage
 	parsePercent := func(val string) (float64, bool) {
@@ -567,7 +569,7 @@ func parseConfig(annotations map[string]string) ResizerConfig {
 			// e.g. "threshold", "cpu-threshold", "requests.memory-threshold"
 			res := strings.TrimSuffix(key, "-threshold")
 			if res == "" {
-				res = "default"
+				res = defaultKey
 			}
 
 			if val, err := strconv.ParseFloat(v, 64); err == nil {
@@ -579,7 +581,7 @@ func parseConfig(annotations map[string]string) ResizerConfig {
 		if strings.HasSuffix(key, "-increment") {
 			res := strings.TrimSuffix(key, "-increment")
 			if res == "" {
-				res = "default"
+				res = defaultKey
 			}
 
 			if val, ok := parsePercent(v); ok {

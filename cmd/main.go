@@ -52,6 +52,8 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
+const trueStr = "true"
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
@@ -86,7 +88,8 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	flag.BoolVar(&enableAutoMerge, "enable-auto-merge", os.Getenv("ENABLE_AUTO_MERGE") == "true",
+
+	flag.BoolVar(&enableAutoMerge, "enable-auto-merge", os.Getenv("ENABLE_AUTO_MERGE") == trueStr,
 		"If set, the controller will automatically merge Pull Requests if checks pass.")
 	opts := zap.Options{
 		Development: true,
@@ -228,7 +231,7 @@ func main() {
 	var errProvider error
 
 	// Check for Dry Run / Simulation Mode
-	if os.Getenv("DRY_RUN") == "true" {
+	if os.Getenv("DRY_RUN") == trueStr {
 		setupLog.Info("Using LogOnlyProvider (Dry Run / Simulation Mode)")
 		gitProvider = git.NewStatefulLogProvider(mgr.GetClient())
 	} else if appID != 0 && installID != 0 && githubPrivateKey != "" {
@@ -255,7 +258,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if (githubOwner == "" || githubRepo == "" || clusterName == "") && os.Getenv("DRY_RUN") != "true" {
+	if (githubOwner == "" || githubRepo == "" || clusterName == "") && os.Getenv("DRY_RUN") != trueStr {
 		setupLog.Error(nil, "GitHub configuration missing", "owner", githubOwner, "repo", githubRepo, "cluster", clusterName)
 		os.Exit(1)
 	}

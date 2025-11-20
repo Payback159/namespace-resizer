@@ -63,7 +63,7 @@ func TestAutoMerge(t *testing.T) {
 		} else {
 			delete(ns.Annotations, config.AnnotationAutoMerge)
 		}
-		fakeClient.Update(context.TODO(), ns)
+		g.Expect(fakeClient.Update(context.TODO(), ns)).To(Succeed())
 
 		fakeGit := &FakeGitProvider{
 			PRStatus: prStatus,

@@ -358,7 +358,11 @@ func applyChangesToYaml(content string, limits map[corev1.ResourceName]resource.
 			return applyChangesToYamlNaive(content, limits)
 		}
 	}
-	encoder.Close()
+
+	err := encoder.Close()
+	if err != nil {
+		return applyChangesToYamlNaive(content, limits)
+	}
 
 	return buf.String()
 }
