@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -106,7 +107,8 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			increment := float64(limitVal) * config.GetIncrement(resName)
 			newLimitVal := int64(float64(limitVal) + increment)
 
-			newLimit := *resource.NewMilliQuantity(newLimitVal, hardLimit.Format)
+			newLimit := convertToReadableFormat(resName, newLimitVal, hardLimit.Format)
+
 			recommendations[resName] = newLimit
 			needsResize = true
 		}
@@ -283,13 +285,17 @@ func (r *ResourceQuotaReconciler) analyzeEvents(ctx context.Context, quota corev
 							// so we need hard + (used + requested - hard) = used + requested.
 							// So NewLimit >= Used + Requested.
 
-							needed := currentUsed.DeepCopy()
-							needed.Add(reqQty)
+							// Calculate base need (Used + Requested)
+							baseMilli := currentUsed.MilliValue() + reqQty.MilliValue()
 
-							// Add buffer (e.g. 10% or config.Increment)
-							// Let's use config.IncrementFactor as buffer
-							buffer := float64(needed.MilliValue()) * config.GetIncrement(resName)
-							needed.Add(*resource.NewMilliQuantity(int64(buffer), currentHard.Format))
+							// Calculate buffer
+							bufferMilli := float64(baseMilli) * config.GetIncrement(resName)
+
+							// Total
+							totalMilli := baseMilli + int64(bufferMilli)
+
+							// Create new Quantity with correct format/rounding
+							needed := convertToReadableFormat(resName, totalMilli, currentHard.Format)
 
 							// Only recommend if the new limit is actually higher than the current limit
 							if needed.Cmp(currentHard) > 0 {
@@ -518,4 +524,21 @@ func (r *ResourceQuotaReconciler) mapEventToQuota(ctx context.Context, obj clien
 			Namespace: evt.Namespace,
 		}},
 	}
+}
+
+func convertToReadableFormat(resName corev1.ResourceName, milliValue int64, format resource.Format) resource.Quantity {
+	if strings.Contains(string(resName), "memory") || strings.Contains(string(resName), "storage") {
+		// Memory/Storage Fix: Convert from Milli-Bytes back to Bytes
+		// 1000 Millis = 1 Byte
+		bytesValue := float64(milliValue) / 1000.0
+
+		// Round up to the nearest Mebibyte (Mi) to ensure readable output (e.g. "123Mi" instead of raw bytes)
+		// Kubernetes resource.Quantity prefers multiples of 1024 for BinarySI to display friendly units.
+		const bytesPerMi = 1024 * 1024
+		miValue := math.Ceil(bytesValue / float64(bytesPerMi))
+		newBytesValue := int64(miValue * float64(bytesPerMi))
+
+		return *resource.NewQuantity(newBytesValue, resource.BinarySI)
+	}
+	return *resource.NewMilliQuantity(milliValue, format)
 }
