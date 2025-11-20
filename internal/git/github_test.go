@@ -60,7 +60,11 @@ spec:
 		},
 		{
 			name: "Handle requests.cpu format",
-			input: `spec:
+			input: `apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: test
+spec:
   hard:
     requests.cpu: "500m"
 `,
@@ -71,7 +75,11 @@ spec:
 		},
 		{
 			name: "Handle storage short name",
-			input: `spec:
+			input: `apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: test
+spec:
   hard:
     storage: "10Gi"
 `,
@@ -90,6 +98,77 @@ spec:
 			}
 		})
 	}
+}
+
+func TestApplyChangesToYaml_MultiDoc(t *testing.T) {
+	g := NewWithT(t)
+
+	// Scenario: A file with a Pod and a ResourceQuota.
+	// The Pod should NOT be touched.
+	// The Quota SHOULD be updated.
+
+	yamlContent := `apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+spec:
+  containers:
+  - name: nginx
+    image: nginx
+    resources:
+      requests:
+        cpu: "100m"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: my-quota
+spec:
+  hard:
+    cpu: "1"
+    requests.cpu: "1"
+`
+
+	limits := map[corev1.ResourceName]resource.Quantity{
+		corev1.ResourceRequestsCPU: resource.MustParse("2"),
+	}
+
+	newContent := applyChangesToYaml(yamlContent, limits)
+
+	// Check that Pod cpu is STILL 100m
+	g.Expect(newContent).To(ContainSubstring(`cpu: "100m"`), "Pod CPU should not be changed")
+
+	// Check that Quota cpu is NOW 2
+	g.Expect(newContent).To(ContainSubstring(`requests.cpu: "2"`), "Quota requests.cpu should be updated")
+}
+
+func TestApplyChangesToYaml_PodOnly(t *testing.T) {
+	g := NewWithT(t)
+
+	// Scenario: A file with only a Pod.
+	// It should NOT be touched.
+
+	yamlContent := `apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+spec:
+  containers:
+  - name: nginx
+    image: nginx
+    resources:
+      requests:
+        cpu: "100m"
+`
+
+	limits := map[corev1.ResourceName]resource.Quantity{
+		corev1.ResourceRequestsCPU: resource.MustParse("2"),
+	}
+
+	newContent := applyChangesToYaml(yamlContent, limits)
+
+	g.Expect(newContent).To(ContainSubstring(`cpu: "100m"`), "Pod CPU should not be changed")
+	g.Expect(newContent).NotTo(ContainSubstring(`cpu: "2"`), "Pod CPU should not be updated to 2")
 }
 
 func TestGeneratePRBody(t *testing.T) {

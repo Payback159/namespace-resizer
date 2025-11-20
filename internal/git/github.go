@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"text/template"
@@ -335,9 +336,20 @@ func generatePRBody(ns, quota string, limits map[corev1.ResourceName]resource.Qu
 }
 
 func applyChangesToYaml(content string, limits map[corev1.ResourceName]resource.Quantity) string {
-	var node yaml.Node
-	if err := yaml.Unmarshal([]byte(content), &node); err != nil {
-		return applyChangesToYamlNaive(content, limits)
+	decoder := yaml.NewDecoder(strings.NewReader(content))
+	var nodes []*yaml.Node
+
+	for {
+		var node yaml.Node
+		if err := decoder.Decode(&node); err != nil {
+			if err == io.EOF {
+				break
+			}
+			// If parsing fails, return original content to avoid corrupting the file
+			// or modifying the wrong resources via naive replacement.
+			return content
+		}
+		nodes = append(nodes, &node)
 	}
 
 	// Helper to find a value node for a given key in a mapping node
@@ -356,51 +368,58 @@ func applyChangesToYaml(content string, limits map[corev1.ResourceName]resource.
 		return nil
 	}
 
-	// Navigate to spec -> hard
-	specNode := findValueNode(&node, "spec")
-	if specNode != nil {
-		hardNode := findValueNode(specNode, "hard")
-		if hardNode != nil && hardNode.Kind == yaml.MappingNode {
-			// We are in 'hard' map
-			for res, qty := range limits {
-				found := false
-				// Try to find and update existing key
-				for i := 0; i < len(hardNode.Content); i += 2 {
-					keyNode := hardNode.Content[i]
-					valNode := hardNode.Content[i+1]
-					if matchesResourceKey(keyNode.Value, res) {
-						valNode.Value = qty.String()
-						valNode.Style = yaml.DoubleQuotedStyle
-						found = true
-						break
-					}
-				}
+	for _, node := range nodes {
+		// Check Kind
+		kindNode := findValueNode(node, "kind")
+		if kindNode == nil || kindNode.Value != "ResourceQuota" {
+			continue
+		}
 
-				// If not found, append new key-value pair
-				if !found {
-					keyNode := &yaml.Node{
-						Kind:  yaml.ScalarNode,
-						Value: string(res),
+		// Navigate to spec -> hard
+		specNode := findValueNode(node, "spec")
+		if specNode != nil {
+			hardNode := findValueNode(specNode, "hard")
+			if hardNode != nil && hardNode.Kind == yaml.MappingNode {
+				// We are in 'hard' map
+				for res, qty := range limits {
+					found := false
+					// Try to find and update existing key
+					for i := 0; i < len(hardNode.Content); i += 2 {
+						keyNode := hardNode.Content[i]
+						valNode := hardNode.Content[i+1]
+						if matchesResourceKey(keyNode.Value, res) {
+							valNode.Value = qty.String()
+							valNode.Style = yaml.DoubleQuotedStyle
+							found = true
+							// Don't break, in case multiple aliases exist (e.g. cpu and requests.cpu)
+						}
 					}
-					valNode := &yaml.Node{
-						Kind:  yaml.ScalarNode,
-						Value: qty.String(),
-						Style: yaml.DoubleQuotedStyle,
+
+					// If not found, append new key-value pair
+					if !found {
+						keyNode := &yaml.Node{
+							Kind:  yaml.ScalarNode,
+							Value: string(res),
+						}
+						valNode := &yaml.Node{
+							Kind:  yaml.ScalarNode,
+							Value: qty.String(),
+							Style: yaml.DoubleQuotedStyle,
+						}
+						hardNode.Content = append(hardNode.Content, keyNode, valNode)
 					}
-					hardNode.Content = append(hardNode.Content, keyNode, valNode)
 				}
 			}
 		}
-	} else {
-		// Fallback if structure is unexpected
-		return applyChangesToYamlNaive(content, limits)
 	}
 
 	var buf bytes.Buffer
 	encoder := yaml.NewEncoder(&buf)
 	encoder.SetIndent(2)
-	if err := encoder.Encode(&node); err != nil {
-		return applyChangesToYamlNaive(content, limits)
+	for _, node := range nodes {
+		if err := encoder.Encode(node); err != nil {
+			return content
+		}
 	}
 	return buf.String()
 }
@@ -419,45 +438,4 @@ func matchesResourceKey(key string, res corev1.ResourceName) bool {
 		return key == "storage" || key == "requests.storage"
 	}
 	return false
-}
-
-func applyChangesToYamlNaive(content string, limits map[corev1.ResourceName]resource.Quantity) string {
-	// Very naive implementation for MVP.
-	// In production, use a YAML AST parser (like go-yaml/v3) to preserve comments.
-	// Here we just look for "cpu: <value>" and replace it.
-
-	lines := strings.Split(content, "\n")
-	for i, line := range lines {
-		for res, qty := range limits {
-			// Determine keys to look for
-			keysToCheck := []string{fmt.Sprintf("%s:", res)}
-			switch res {
-			case corev1.ResourceRequestsCPU:
-				keysToCheck = append(keysToCheck, "cpu:")
-			case corev1.ResourceRequestsMemory:
-				keysToCheck = append(keysToCheck, "memory:")
-			case corev1.ResourceRequestsStorage:
-				keysToCheck = append(keysToCheck, "storage:")
-			}
-
-			for _, key := range keysToCheck {
-				// Check if line contains resource key (e.g. "cpu:")
-				// We use TrimSpace to ensure we are matching the key, not just a substring
-				trimmed := strings.TrimSpace(line)
-				if strings.HasPrefix(trimmed, key) {
-					// Replace the value
-					// Assume format "  cpu: 1000m"
-					parts := strings.Split(line, ":")
-					if len(parts) >= 2 {
-						// Keep indentation
-						indent := parts[0]
-						lines[i] = fmt.Sprintf("%s: %s", indent, qty.String())
-						// Break inner loop (keys) once matched
-						break
-					}
-				}
-			}
-		}
-	}
-	return strings.Join(lines, "\n")
 }
