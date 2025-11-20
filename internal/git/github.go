@@ -397,14 +397,13 @@ func matchesResourceKey(key string, res corev1.ResourceName) bool {
 		return true
 	}
 	// Handle short names
-	if res == corev1.ResourceRequestsCPU && key == "cpu" {
-		return true
-	}
-	if res == corev1.ResourceRequestsMemory && key == "memory" {
-		return true
-	}
-	if res == corev1.ResourceRequestsStorage && key == "storage" {
-		return true
+	switch res {
+	case corev1.ResourceRequestsCPU:
+		return key == "cpu"
+	case corev1.ResourceRequestsMemory:
+		return key == "memory"
+	case corev1.ResourceRequestsStorage:
+		return key == "storage"
 	}
 	return false
 }
@@ -418,14 +417,13 @@ func applyChangesToYamlNaive(content string, limits map[corev1.ResourceName]reso
 	for i, line := range lines {
 		for res, qty := range limits {
 			// Determine keys to look for
-			// "requests.cpu" -> look for "requests.cpu:" AND "cpu:"
-			// "requests.memory" -> look for "requests.memory:" AND "memory:"
 			keysToCheck := []string{fmt.Sprintf("%s:", res)}
-			if res == corev1.ResourceRequestsCPU {
+			switch res {
+			case corev1.ResourceRequestsCPU:
 				keysToCheck = append(keysToCheck, "cpu:")
-			} else if res == corev1.ResourceRequestsMemory {
+			case corev1.ResourceRequestsMemory:
 				keysToCheck = append(keysToCheck, "memory:")
-			} else if res == corev1.ResourceRequestsStorage {
+			case corev1.ResourceRequestsStorage:
 				keysToCheck = append(keysToCheck, "storage:")
 			}
 
