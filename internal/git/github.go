@@ -403,6 +403,9 @@ func matchesResourceKey(key string, res corev1.ResourceName) bool {
 	if res == corev1.ResourceRequestsMemory && key == "memory" {
 		return true
 	}
+	if res == corev1.ResourceRequestsStorage && key == "storage" {
+		return true
+	}
 	return false
 }
 
@@ -422,6 +425,8 @@ func applyChangesToYamlNaive(content string, limits map[corev1.ResourceName]reso
 				keysToCheck = append(keysToCheck, "cpu:")
 			} else if res == corev1.ResourceRequestsMemory {
 				keysToCheck = append(keysToCheck, "memory:")
+			} else if res == corev1.ResourceRequestsStorage {
+				keysToCheck = append(keysToCheck, "storage:")
 			}
 
 			for _, key := range keysToCheck {

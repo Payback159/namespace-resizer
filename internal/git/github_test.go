@@ -69,6 +69,17 @@ spec:
 			},
 			expected: []string{`requests.cpu: "1"`},
 		},
+		{
+			name: "Handle storage short name",
+			input: `spec:
+  hard:
+    storage: "10Gi"
+`,
+			limits: map[corev1.ResourceName]resource.Quantity{
+				corev1.ResourceRequestsStorage: resource.MustParse("20Gi"),
+			},
+			expected: []string{`storage: "20Gi"`},
+		},
 	}
 
 	for _, tt := range tests {
