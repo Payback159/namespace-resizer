@@ -26,8 +26,12 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -249,6 +253,10 @@ func (r *ResourceQuotaReconciler) analyzeEvents(ctx context.Context, quota corev
 	// Look for recent FailedCreate events mentioning this quota
 	cutoff := time.Now().Add(-1 * time.Hour) // Only look at events from last hour
 
+	// Map to store max requested per resource per object UID to handle multiple failing workloads
+	// map[ResourceName]map[UID]int64 (milli-value)
+	deficits := make(map[corev1.ResourceName]map[types.UID]int64)
+
 	for _, evt := range eventList.Items {
 		if evt.LastTimestamp.Time.Before(cutoff) {
 			continue
@@ -260,76 +268,111 @@ func (r *ResourceQuotaReconciler) analyzeEvents(ctx context.Context, quota corev
 			continue
 		}
 
-		// Parse message: "exceeded quota: my-quota, requested: cpu=1, used: cpu=10, limited: cpu=10"
-		// This is a simplified parser. Real world messages vary.
-		// We look for "requested: <res>=<val>"
+		// 1. Parse Message
+		resName, reqQty, err := parseEventMessage(evt.Message)
+		if err != nil {
+			continue
+		}
 
-		// Example logic for parsing (simplified)
-		// In a real implementation, we would need a robust regex or parser.
-		// For MVP, let's assume we can extract the resource name and requested amount if it follows standard format.
+		// 2. Liveness Check
+		// Ensure the object causing the event still exists.
+		// This prevents "ghost" deficits from deleted workloads (e.g. during rollback/restart).
+		if !r.isObjectAlive(ctx, evt.InvolvedObject, quota.Namespace) {
+			continue
+		}
 
-		// TODO: Implement robust parsing.
-		// For now, we just check if we can find "requested: " and try to guess.
-		// Actually, without robust parsing, we can't calculate exact deficit.
-		// But we can fallback to a larger increment if we detect an event.
+		// 3. Update Deficits
+		// Initialize map for this resource if needed
+		if _, ok := deficits[resName]; !ok {
+			deficits[resName] = make(map[types.UID]int64)
+		}
 
-		// Let's try to parse "requested: cpu=500m"
-		// Split by comma
-		parts := strings.Split(evt.Message, ",")
-		for _, part := range parts {
-			part = strings.TrimSpace(part)
-			if strings.HasPrefix(part, "requested: ") {
-				// "requested: cpu=500m"
-				reqPart := strings.TrimPrefix(part, "requested: ")
-				// "cpu=500m"
-				kv := strings.Split(reqPart, "=")
-				if len(kv) == 2 {
-					resName := corev1.ResourceName(kv[0])
-					reqQty, err := resource.ParseQuantity(kv[1])
-					if err == nil {
-						// Calculate Deficit
-						// Deficit = (Used + Requested) - Hard
-						// NewLimit = Hard + Deficit + Buffer
-						// Buffer could be 10% or fixed.
+		// Store the max requested value seen for this specific object UID
+		if reqQty.MilliValue() > deficits[resName][evt.InvolvedObject.UID] {
+			deficits[resName][evt.InvolvedObject.UID] = reqQty.MilliValue()
+		}
+	}
 
-						if currentHard, ok := quota.Status.Hard[resName]; ok {
-							currentUsed := quota.Status.Used[resName]
+	// Now calculate recommendations based on total deficits
+	for resName, uidMap := range deficits {
+		var totalDeficit int64
+		for _, val := range uidMap {
+			totalDeficit += val
+		}
 
-							// deficit = (used + requested) - hard
-							// actually, if it failed, used + requested > hard.
-							// so we need hard + (used + requested - hard) = used + requested.
-							// So NewLimit >= Used + Requested.
+		if currentHard, ok := quota.Status.Hard[resName]; ok {
+			currentUsed := quota.Status.Used[resName]
 
-							// Calculate base need (Used + Requested)
-							baseMilli := currentUsed.MilliValue() + reqQty.MilliValue()
+			// Calculate base need (Used + Total Deficit from all failing workloads)
+			baseMilli := currentUsed.MilliValue() + totalDeficit
 
-							// Calculate buffer
-							bufferMilli := float64(baseMilli) * config.GetIncrement(resName)
+			// Calculate buffer based on the NEW total need
+			bufferMilli := float64(baseMilli) * config.GetIncrement(resName)
 
-							// Total
-							totalMilli := baseMilli + int64(bufferMilli)
+			// Total
+			totalMilli := baseMilli + int64(bufferMilli)
 
-							// Create new Quantity with correct format/rounding
-							needed := convertToReadableFormat(resName, totalMilli, currentHard.Format)
+			// Create new Quantity with correct format/rounding
+			needed := convertToReadableFormat(resName, totalMilli, currentHard.Format)
 
-							// Only recommend if the new limit is actually higher than the current limit
-							if needed.Cmp(currentHard) > 0 {
-								// Check if we already have a higher recommendation for this resource
-								if existing, ok := recommendations[resName]; ok {
-									if needed.Cmp(existing) > 0 {
-										recommendations[resName] = needed
-									}
-								} else {
-									recommendations[resName] = needed
-								}
-							}
-						}
-					}
+			// Only recommend if the new limit is actually higher than the current limit
+			if needed.Cmp(currentHard) > 0 {
+				recommendations[resName] = needed
+			}
+		}
+	}
+
+	return recommendations, nil
+}
+
+func parseEventMessage(message string) (corev1.ResourceName, resource.Quantity, error) {
+	// Parse message: "exceeded quota: my-quota, requested: cpu=1, used: cpu=10, limited: cpu=10"
+	parts := strings.Split(message, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "requested: ") {
+			// "requested: cpu=500m"
+			reqPart := strings.TrimPrefix(part, "requested: ")
+			// "cpu=500m"
+			kv := strings.Split(reqPart, "=")
+			if len(kv) == 2 {
+				resName := corev1.ResourceName(kv[0])
+				reqQty, err := resource.ParseQuantity(kv[1])
+				if err == nil {
+					return resName, reqQty, nil
 				}
 			}
 		}
 	}
-	return recommendations, nil
+	return "", resource.Quantity{}, fmt.Errorf("failed to parse message")
+}
+
+func (r *ResourceQuotaReconciler) isObjectAlive(ctx context.Context, ref corev1.ObjectReference, namespace string) bool {
+	// Construct Unstructured object to query API
+	u := &unstructured.Unstructured{}
+	gv, err := schema.ParseGroupVersion(ref.APIVersion)
+	if err != nil {
+		// Fallback: try to guess or just fail safe (assume not alive if we can't parse)
+		// But APIVersion should be valid in Event.
+		return false
+	}
+	u.SetGroupVersionKind(gv.WithKind(ref.Kind))
+
+	key := types.NamespacedName{Name: ref.Name, Namespace: namespace}
+	if err := r.Get(ctx, key, u); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false
+		}
+		// On other errors (e.g. API down), we assume false to be safe and avoid over-provisioning
+		return false
+	}
+
+	// Verify UID matches to ensure it's the exact same object instance
+	if u.GetUID() != ref.UID {
+		return false
+	}
+
+	return true
 }
 
 func (c ResizerConfig) GetThreshold(res corev1.ResourceName) float64 {

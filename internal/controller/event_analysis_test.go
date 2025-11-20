@@ -10,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -41,11 +42,40 @@ func TestAnalyzeEvents_Concurrency(t *testing.T) {
 	// If the controller just overwrites, the small one will win (bug).
 	// Fake client might sort by name. So we name the large one "a" and small one "b".
 
+	// We need to create the "Alive" objects for the liveness check to pass.
+	// Since the test doesn't specify UIDs in events, we should add them and create matching objects.
+	// Note: In this test, we assume they are the SAME workload (same UID) or different?
+	// The test name is "Concurrency", implying maybe different events.
+	// If we give them different UIDs, the new logic will SUM them (10 + 5 + 2 = 17).
+	// But the test expects MAX (15).
+	// This implies the original test assumed they were competing for the same quota but maybe not additive?
+	// Or maybe the original logic was "Max wins".
+	// If we want to preserve the "Max wins" behavior for THIS test, we should give them the SAME UID (Retry scenario).
+	// If we give them the same UID, the logic takes the MAX requested (5 vs 2 -> 5).
+	// So Total = Used (10) + Max(5, 2) = 15.
+	// This matches the expectation.
+
+	uid := types.UID("uid-1")
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-1",
+			Namespace: "default",
+			UID:       uid,
+		},
+	}
+
 	// Event Large: Needs 5 CPU (Total 15)
 	eventLarge := corev1.Event{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "event-a-large",
 			Namespace: "default",
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:       "Pod",
+			APIVersion: "v1",
+			Name:       "pod-1",
+			Namespace:  "default",
+			UID:        uid,
 		},
 		Type:          corev1.EventTypeWarning,
 		Reason:        "FailedCreate",
@@ -59,6 +89,13 @@ func TestAnalyzeEvents_Concurrency(t *testing.T) {
 			Name:      "event-b-small",
 			Namespace: "default",
 		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:       "Pod",
+			APIVersion: "v1",
+			Name:       "pod-1",
+			Namespace:  "default",
+			UID:        uid,
+		},
 		Type:          corev1.EventTypeWarning,
 		Reason:        "FailedCreate",
 		Message:       "exceeded quota: test-quota, requested: cpu=2, used: cpu=10, limited: cpu=10",
@@ -69,6 +106,7 @@ func TestAnalyzeEvents_Concurrency(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithLists(&corev1.EventList{Items: []corev1.Event{eventLarge, eventSmall}}).
+		WithObjects(&pod). // Add Pod so Liveness Check passes
 		Build()
 
 	r := &ResourceQuotaReconciler{
@@ -127,10 +165,27 @@ func TestAnalyzeEvents_Memory(t *testing.T) {
 
 	// 2. Setup Event (Memory Burst)
 	// "requested: memory=512Mi"
+
+	uid := types.UID("uid-mem")
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-mem",
+			Namespace: "default",
+			UID:       uid,
+		},
+	}
+
 	eventMem := corev1.Event{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "event-mem",
 			Namespace: "default",
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:       "Pod",
+			APIVersion: "v1",
+			Name:       "pod-mem",
+			Namespace:  "default",
+			UID:        uid,
 		},
 		Type:          corev1.EventTypeWarning,
 		Reason:        "FailedCreate",
@@ -141,6 +196,7 @@ func TestAnalyzeEvents_Memory(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithLists(&corev1.EventList{Items: []corev1.Event{eventMem}}).
+		WithObjects(&pod). // Add Pod so Liveness Check passes
 		Build()
 
 	r := &ResourceQuotaReconciler{
