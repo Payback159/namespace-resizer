@@ -156,3 +156,36 @@ Die Leases werden im **Namespace des Controllers** (z.B. `namespace-resizer-syst
 *   **Performance:** Spart teure "List PRs" Calls gegen die GitHub API.
 *   **Stabilität:** Der Status "Wir arbeiten gerade an Namespace X" liegt im Cluster.
 *   **GitOps-Safe:** Da die Leases im System-Namespace liegen, werden sie nicht vom GitOps-Sync des App-Teams gelöscht.
+
+### 3.4. Auto-Merge Strategie
+
+Um den Kreis zu schließen und einen vollautomatischen Betrieb zu ermöglichen, kann der Controller Pull Requests selbstständig mergen, sofern bestimmte Kriterien erfüllt sind.
+
+**Konfiguration:**
+1.  **Global:** Der Controller verfügt über ein Flag `--enable-auto-merge` (Default: `false`).
+2.  **Namespace (Opt-Out):** Wenn global aktiviert, kann das Verhalten pro Namespace deaktiviert werden:
+    `resizer.io/auto-merge: "false"`
+
+*Logik:*
+*   Global `false`: Auto-Merge ist immer aus (Sicherheitsnetz).
+*   Global `true` + Annotation `false`: Auto-Merge ist aus für diesen Namespace.
+*   Global `true` + Keine Annotation: Auto-Merge ist **an**.
+
+**Voraussetzungen für Auto-Merge:**
+Der Controller prüft bei jedem Reconcile-Loop (wenn ein Lock/PR existiert) den Status des PRs in GitHub:
+1.  **Mergeable:** GitHub meldet keinen Konflikt (`mergeable: true`).
+2.  **CI Checks:** Der `MergeableState` muss `clean` sein (alle erforderlichen Status-Checks sind erfolgreich durchgelaufen).
+3.  **State:** Der PR muss offen sein.
+
+**Ablauf:**
+1.  Controller findet aktives Lock & PR.
+2.  Controller fragt PR-Status via GitHub API ab.
+3.  Wenn `auto-merge: "true"` UND Voraussetzungen erfüllt:
+    *   Controller führt Merge durch (Squash-Merge bevorzugt).
+    *   Controller löscht das Lock (Lease).
+4.  Wenn Voraussetzungen nicht erfüllt (z.B. CI läuft noch):
+    *   Controller wartet (Requeue).
+
+**Sicherheit:**
+*   Race Conditions (Merge vs. ArgoCD Sync) werden durch die Idempotenz des Controllers abgefangen. Nach dem Merge bleibt die Quota im Cluster kurzzeitig "zu niedrig", bis ArgoCD synct. Der Controller sieht zwar weiterhin den Bedarf, findet aber keinen offenen PR mehr (da gemerged). Er würde theoretisch einen neuen PR erstellen wollen, aber wir können prüfen, ob der letzte Merge erst vor kurzem war (Cooldown) oder ob der Head-Commit des Repos bereits die Änderung enthält.
+*   Alternativ: Der Controller wartet einfach. Wenn ArgoCD synct, verschwindet der "Threshold exceeded" Zustand.

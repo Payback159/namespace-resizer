@@ -36,6 +36,16 @@
 - [x] CI/CD Pipeline für Releases (`.github/workflows/release.yml`)
 - [x] Dokumentation aktualisieren (Installation, Konfiguration)
 
-## Phase 6: Future Work
+## Phase 6: Advanced GitOps (Auto-Merge)
+- [ ] Konfiguration: Annotation `resizer.io/auto-merge` definieren
+- [ ] GitHub Provider erweitern:
+    - [ ] `GetPRStatus` (Mergeable, Checks Status)
+    - [ ] `MergePR` (Squash Merge)
+- [ ] Controller Logik:
+    - [ ] Im Reconcile-Loop PR-Status prüfen
+    - [ ] Merge ausführen wenn Conditions met
+- [ ] Tests für Auto-Merge Logik
+
+## Phase 7: Future Work
 - [ ] Metrics Export (Prometheus)
 - [ ] Webhook für Validierung

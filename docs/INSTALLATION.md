@@ -49,12 +49,18 @@ Der Controller wird primär über **Annotations** an den Namespaces konfiguriert
 
 Damit der Controller Pull Requests erstellen kann, muss er authentifiziert werden. Siehe [AUTHENTICATION.md](AUTHENTICATION.md) für Details zur Einrichtung von GitHub Apps oder Personal Access Tokens.
 
-Die Credentials werden als Secret im Controller-Namespace erwartet:
+## GitHub Branch Protection & Auto-Merge
 
-```bash
-kubectl create secret generic github-auth \
-  --from-literal=app-id=12345 \
-  --from-literal=installation-id=67890 \
-  --from-file=private-key=private-key.pem \
-  -n namespace-resizer-system
-```
+Wenn du das **Auto-Merge** Feature nutzen möchtest und in deinem Repository "Branch Protection Rules" (z.B. "Require pull request reviews before merging") aktiviert hast, musst du dem Controller erlauben, diese Regeln zu umgehen.
+
+### Einrichtung der "Bypass List"
+
+1.  Gehe in deinem GitHub Repository zu **Settings** > **Branches**.
+2.  Klicke auf **Edit** neben der Branch Protection Rule für deinen Haupt-Branch (z.B. `main`).
+3.  Suche den Abschnitt **"Require a pull request before merging"**.
+4.  Suche die Option **"Allow specified actors to bypass required pull request reviews"**.
+    *   *Hinweis:* Diese Option ist nur verfügbar, wenn "Require pull request reviews before merging" aktiviert ist.
+5.  Suche nach dem User oder der GitHub App, die der Controller verwendet (siehe `AUTHENTICATION.md`), und füge sie hinzu.
+6.  Speichere die Änderungen ("Save changes").
+
+Damit darf der Controller seine eigenen Pull Requests mergen, auch wenn keine manuellen Reviews vorliegen.
