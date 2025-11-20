@@ -13,6 +13,7 @@ import (
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/google/go-github/v60/github"
 	"golang.org/x/oauth2"
+	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
@@ -334,6 +335,78 @@ func generatePRBody(ns, quota string, limits map[corev1.ResourceName]resource.Qu
 }
 
 func applyChangesToYaml(content string, limits map[corev1.ResourceName]resource.Quantity) string {
+	var node yaml.Node
+	if err := yaml.Unmarshal([]byte(content), &node); err != nil {
+		// Fallback to naive implementation if parsing fails
+		return applyChangesToYamlNaive(content, limits)
+	}
+
+	// Walk the AST to find spec.hard fields
+	// We look for the path: spec -> hard -> [resourceName]
+	updateYamlNode(&node, limits)
+
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(&node); err != nil {
+		return applyChangesToYamlNaive(content, limits)
+	}
+
+	return buf.String()
+}
+
+func updateYamlNode(node *yaml.Node, limits map[corev1.ResourceName]resource.Quantity) {
+	// Recursive walk
+	if node.Kind == yaml.DocumentNode {
+		for _, child := range node.Content {
+			updateYamlNode(child, limits)
+		}
+		return
+	}
+
+	if node.Kind == yaml.MappingNode {
+		// Check if we are in "spec" -> "hard"
+		// This is a simplified traversal. A robust one would track path context.
+		// For now, we just look for keys that match our resources ANYWHERE in the file
+		// which is safer than the string replace but still heuristic.
+		// Ideally, we should verify we are under spec.hard.
+
+		for i := 0; i < len(node.Content); i += 2 {
+			keyNode := node.Content[i]
+			valNode := node.Content[i+1]
+
+			if keyNode.Kind == yaml.ScalarNode {
+				// Check if this key matches any of our resources
+				for res, qty := range limits {
+					if matchesResourceKey(keyNode.Value, res) {
+						// Update the value node
+						valNode.Value = qty.String()
+						valNode.Style = yaml.DoubleQuotedStyle // Force quotes for safety (e.g. "100m")
+					}
+				}
+			}
+			
+			// Recurse into value (e.g. to find nested keys)
+			updateYamlNode(valNode, limits)
+		}
+	}
+}
+
+func matchesResourceKey(key string, res corev1.ResourceName) bool {
+	if key == string(res) {
+		return true
+	}
+	// Handle short names
+	if res == corev1.ResourceRequestsCPU && key == "cpu" {
+		return true
+	}
+	if res == corev1.ResourceRequestsMemory && key == "memory" {
+		return true
+	}
+	return false
+}
+
+func applyChangesToYamlNaive(content string, limits map[corev1.ResourceName]resource.Quantity) string {
 	// Very naive implementation for MVP.
 	// In production, use a YAML AST parser (like go-yaml/v3) to preserve comments.
 	// Here we just look for "cpu: <value>" and replace it.
@@ -341,16 +414,31 @@ func applyChangesToYaml(content string, limits map[corev1.ResourceName]resource.
 	lines := strings.Split(content, "\n")
 	for i, line := range lines {
 		for res, qty := range limits {
-			// Check if line contains resource key (e.g. "cpu:")
-			// This is fragile but works for the demo if the format is standard.
-			if strings.Contains(line, fmt.Sprintf("%s:", res)) {
-				// Replace the value
-				// Assume format "  cpu: 1000m"
-				parts := strings.Split(line, ":")
-				if len(parts) == 2 {
-					// Keep indentation
-					indent := parts[0]
-					lines[i] = fmt.Sprintf("%s: %s", indent, qty.String())
+			// Determine keys to look for
+			// "requests.cpu" -> look for "requests.cpu:" AND "cpu:"
+			// "requests.memory" -> look for "requests.memory:" AND "memory:"
+			keysToCheck := []string{fmt.Sprintf("%s:", res)}
+			if res == corev1.ResourceRequestsCPU {
+				keysToCheck = append(keysToCheck, "cpu:")
+			} else if res == corev1.ResourceRequestsMemory {
+				keysToCheck = append(keysToCheck, "memory:")
+			}
+
+			for _, key := range keysToCheck {
+				// Check if line contains resource key (e.g. "cpu:")
+				// We use TrimSpace to ensure we are matching the key, not just a substring
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, key) {
+					// Replace the value
+					// Assume format "  cpu: 1000m"
+					parts := strings.Split(line, ":")
+					if len(parts) >= 2 {
+						// Keep indentation
+						indent := parts[0]
+						lines[i] = fmt.Sprintf("%s: %s", indent, qty.String())
+						// Break inner loop (keys) once matched
+						break
+					}
 				}
 			}
 		}

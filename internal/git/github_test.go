@@ -18,31 +18,67 @@ import (
 func TestApplyChangesToYaml(t *testing.T) {
 	g := NewWithT(t)
 
-	original := `
-apiVersion: v1
+	tests := []struct {
+		name     string
+		input    string
+		limits   map[corev1.ResourceName]resource.Quantity
+		expected []string // Substrings to expect
+	}{
+		{
+			name: "Simple replacement",
+			input: `apiVersion: v1
 kind: ResourceQuota
 metadata:
-  name: my-quota
+  name: test
 spec:
   hard:
-    requests.cpu: "1"
-    requests.memory: 1Gi
-    limits.cpu: "2"
-`
-	limits := map[corev1.ResourceName]resource.Quantity{
-		corev1.ResourceRequestsCPU: resource.MustParse("2"),
-		corev1.ResourceLimitsCPU:   resource.MustParse("4"),
+    cpu: "1000m"
+    memory: 1Gi
+`,
+			limits: map[corev1.ResourceName]resource.Quantity{
+				corev1.ResourceCPU:    resource.MustParse("2"),
+				corev1.ResourceMemory: resource.MustParse("2Gi"),
+			},
+			expected: []string{`cpu: "2"`, `memory: "2Gi"`},
+		},
+		{
+			name: "Preserve comments",
+			input: `apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: test # My Quota
+spec:
+  hard:
+    # CPU Limit
+    cpu: "1000m"
+    pods: "10"
+`,
+			limits: map[corev1.ResourceName]resource.Quantity{
+				corev1.ResourceCPU: resource.MustParse("4"),
+			},
+			expected: []string{`# CPU Limit`, `cpu: "4"`, `pods: "10"`},
+		},
+		{
+			name: "Handle requests.cpu format",
+			input: `spec:
+  hard:
+    requests.cpu: "500m"
+`,
+			limits: map[corev1.ResourceName]resource.Quantity{
+				corev1.ResourceRequestsCPU: resource.MustParse("1"),
+			},
+			expected: []string{`requests.cpu: "1"`},
+		},
 	}
 
-	result := applyChangesToYaml(original, limits)
-
-	// Note: The naive implementation might mess up spacing or quotes,
-	// so we should be lenient or fix the implementation if needed.
-	// The current implementation preserves indentation of the key.
-
-	g.Expect(result).To(ContainSubstring("requests.cpu: 2"))
-	g.Expect(result).To(ContainSubstring("limits.cpu: 4"))
-	g.Expect(result).To(ContainSubstring("requests.memory: 1Gi"))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := applyChangesToYaml(tt.input, tt.limits)
+			for _, exp := range tt.expected {
+				g.Expect(got).To(ContainSubstring(exp))
+			}
+		})
+	}
 }
 
 func TestGeneratePRBody(t *testing.T) {
