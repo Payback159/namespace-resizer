@@ -28,6 +28,7 @@ func (p *LogOnlyProvider) GetPRStatus(ctx context.Context, prID int) (*PRStatus,
 		IsMerged:       false,
 		Mergeable:      true,
 		MergeableState: "clean",
+		ChecksState:    "success",
 	}, nil
 }
 

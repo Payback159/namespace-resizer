@@ -31,6 +31,7 @@ type PRStatus struct {
 	IsMerged       bool
 	Mergeable      bool
 	MergeableState string
+	ChecksState    string
 }
 
 type GitHubProvider struct {
@@ -106,11 +107,20 @@ func (g *GitHubProvider) GetPRStatus(ctx context.Context, prID int) (*PRStatus, 
 		return nil, err
 	}
 
+	var checksState string
+	if pr.Head != nil && pr.Head.SHA != nil {
+		status, _, err := g.client.Repositories.GetCombinedStatus(ctx, g.owner, g.repo, *pr.Head.SHA, nil)
+		if err == nil {
+			checksState = status.GetState()
+		}
+	}
+
 	return &PRStatus{
 		IsOpen:         pr.GetState() == "open",
 		IsMerged:       pr.GetMerged(),
 		Mergeable:      pr.GetMergeable(),
 		MergeableState: pr.GetMergeableState(),
+		ChecksState:    checksState,
 	}, nil
 }
 
