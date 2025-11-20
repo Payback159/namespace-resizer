@@ -404,15 +404,28 @@ func (r *ResourceQuotaReconciler) analyzeEvents(ctx context.Context, quota corev
 			totalDeficit += val
 		}
 
-		// Resolve Quota Resource Name (Map cpu -> requests.cpu if needed)
+		// Resolve Quota Resource Name (Map cpu -> requests.cpu if needed, or vice versa)
 		quotaResName := resName
 		if _, ok := quota.Status.Hard[quotaResName]; !ok {
-			if resName == corev1.ResourceCPU {
+			// 1. Try mapping Short -> Long (cpu -> requests.cpu)
+			switch resName {
+			case corev1.ResourceCPU:
 				quotaResName = corev1.ResourceRequestsCPU
-			} else if resName == corev1.ResourceMemory {
+			case corev1.ResourceMemory:
 				quotaResName = corev1.ResourceRequestsMemory
-			} else if resName == corev1.ResourceStorage {
+			case corev1.ResourceStorage:
 				quotaResName = corev1.ResourceRequestsStorage
+			}
+
+			// 2. If still not found, try mapping Long -> Short (requests.cpu -> cpu)
+			// This handles cases where Quota uses legacy "cpu" but we calculated "requests.cpu"
+			if _, ok := quota.Status.Hard[quotaResName]; !ok {
+				switch resName {
+				case corev1.ResourceRequestsCPU:
+					quotaResName = corev1.ResourceCPU
+				case corev1.ResourceRequestsMemory:
+					quotaResName = corev1.ResourceMemory
+				}
 			}
 		}
 

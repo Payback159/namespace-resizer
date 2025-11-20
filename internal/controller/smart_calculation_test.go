@@ -93,13 +93,13 @@ func TestCalculateWorkloadDeficit_StatefulSet_SmartCalculation(t *testing.T) {
 	// Mem: 300Mi
 	// Storage: 3Gi
 
-	assert.Equal(t, int64(600), deficits[corev1.ResourceCPU], "CPU deficit should be 600m")
+	assert.Equal(t, int64(600), deficits[corev1.ResourceRequestsCPU], "CPU deficit should be 600m")
 
 	expectedMem := memReq.MilliValue() * 3
-	assert.Equal(t, expectedMem, deficits[corev1.ResourceMemory], "Memory deficit should be 300Mi")
+	assert.Equal(t, expectedMem, deficits[corev1.ResourceRequestsMemory], "Memory deficit should be 300Mi")
 
 	expectedStorage := storageReq.MilliValue() * 3
-	assert.Equal(t, expectedStorage, deficits[corev1.ResourceStorage], "Storage deficit should be 3Gi")
+	assert.Equal(t, expectedStorage, deficits[corev1.ResourceRequestsStorage], "Storage deficit should be 3Gi")
 }
 
 func TestCalculateWorkloadDeficit_DaemonSet_SmartCalculation(t *testing.T) {
@@ -166,10 +166,10 @@ func TestCalculateWorkloadDeficit_DaemonSet_SmartCalculation(t *testing.T) {
 	// CPU: 300m
 	// Mem: 150Mi
 
-	assert.Equal(t, int64(300), deficits[corev1.ResourceCPU], "CPU deficit should be 300m")
+	assert.Equal(t, int64(300), deficits[corev1.ResourceRequestsCPU], "CPU deficit should be 300m")
 
 	expectedMem := memReq.MilliValue() * 3
-	assert.Equal(t, expectedMem, deficits[corev1.ResourceMemory], "Memory deficit should be 150Mi")
+	assert.Equal(t, expectedMem, deficits[corev1.ResourceRequestsMemory], "Memory deficit should be 150Mi")
 }
 
 func TestCalculateWorkloadDeficit_ReplicaSet_SmartCalculation(t *testing.T) {
@@ -238,8 +238,8 @@ func TestCalculateWorkloadDeficit_ReplicaSet_SmartCalculation(t *testing.T) {
 	// Mem: 600Mi
 
 	expectedCPU := cpuReq.MilliValue() * 3
-	assert.Equal(t, expectedCPU, deficits[corev1.ResourceCPU], "CPU deficit should be 1500m")
+	assert.Equal(t, expectedCPU, deficits[corev1.ResourceRequestsCPU], "CPU deficit should be 1500m")
 
 	expectedMem := memReq.MilliValue() * 3
-	assert.Equal(t, expectedMem, deficits[corev1.ResourceMemory], "Memory deficit should be 600Mi")
+	assert.Equal(t, expectedMem, deficits[corev1.ResourceRequestsMemory], "Memory deficit should be 600Mi")
 }
