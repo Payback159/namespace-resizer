@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"text/template"
@@ -335,22 +336,29 @@ func generatePRBody(ns, quota string, limits map[corev1.ResourceName]resource.Qu
 }
 
 func applyChangesToYaml(content string, limits map[corev1.ResourceName]resource.Quantity) string {
-	var node yaml.Node
-	if err := yaml.Unmarshal([]byte(content), &node); err != nil {
-		// Fallback to naive implementation if parsing fails
-		return applyChangesToYamlNaive(content, limits)
-	}
-
-	// Walk the AST to find spec.hard fields
-	// We look for the path: spec -> hard -> [resourceName]
-	updateYamlNode(&node, limits)
-
+	decoder := yaml.NewDecoder(strings.NewReader(content))
 	var buf bytes.Buffer
-	enc := yaml.NewEncoder(&buf)
-	enc.SetIndent(2)
-	if err := enc.Encode(&node); err != nil {
-		return applyChangesToYamlNaive(content, limits)
+	encoder := yaml.NewEncoder(&buf)
+	encoder.SetIndent(2)
+
+	for {
+		var node yaml.Node
+		if err := decoder.Decode(&node); err != nil {
+			if err == io.EOF {
+				break
+			}
+			// Fallback to naive implementation if parsing fails
+			return applyChangesToYamlNaive(content, limits)
+		}
+
+		// Walk the AST to find spec.hard fields
+		updateYamlNode(&node, limits)
+
+		if err := encoder.Encode(&node); err != nil {
+			return applyChangesToYamlNaive(content, limits)
+		}
 	}
+	encoder.Close()
 
 	return buf.String()
 }
@@ -385,7 +393,7 @@ func updateYamlNode(node *yaml.Node, limits map[corev1.ResourceName]resource.Qua
 					}
 				}
 			}
-			
+
 			// Recurse into value (e.g. to find nested keys)
 			updateYamlNode(valNode, limits)
 		}

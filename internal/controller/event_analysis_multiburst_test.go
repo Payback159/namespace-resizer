@@ -51,14 +51,14 @@ func TestAnalyzeEvents_MultiBurst(t *testing.T) {
 	// We need to create the "Alive" objects for the liveness check to pass.
 	podA := corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "pod-a",
+			Name:      "app-a-xyz",
 			Namespace: "default",
 			UID:       types.UID("uid-1"),
 		},
 	}
 	podB := corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "pod-b",
+			Name:      "app-b-xyz",
 			Namespace: "default",
 			UID:       types.UID("uid-2"),
 		},
@@ -73,7 +73,7 @@ func TestAnalyzeEvents_MultiBurst(t *testing.T) {
 		InvolvedObject: corev1.ObjectReference{
 			Kind:       "Pod",
 			APIVersion: "v1",
-			Name:       "pod-a",
+			Name:       "app-a-xyz",
 			Namespace:  "default",
 			UID:        types.UID("uid-1"),
 		},
@@ -92,7 +92,7 @@ func TestAnalyzeEvents_MultiBurst(t *testing.T) {
 		InvolvedObject: corev1.ObjectReference{
 			Kind:       "Pod",
 			APIVersion: "v1",
-			Name:       "pod-b",
+			Name:       "app-b-xyz",
 			Namespace:  "default",
 			UID:        types.UID("uid-2"),
 		},
@@ -111,7 +111,7 @@ func TestAnalyzeEvents_MultiBurst(t *testing.T) {
 		InvolvedObject: corev1.ObjectReference{
 			Kind:       "Pod",
 			APIVersion: "v1",
-			Name:       "pod-a",
+			Name:       "app-a-xyz",
 			Namespace:  "default",
 			UID:        types.UID("uid-1"),
 		},

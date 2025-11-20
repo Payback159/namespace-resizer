@@ -17,7 +17,11 @@ if ! command -v kubectl &> /dev/null; then
     exit 1
 fi
 
-# 2. Create/Reuse Cluster
+# 2. Reset Demo Repository
+echo "🧹 Resetting Demo Repository to clean state..."
+./hack/reset-demo-repo.sh "$DEMO_REPO_PATH"
+
+# 3. Create/Reuse Cluster
 if kind get clusters | grep -q "^$CLUSTER_NAME$"; then
     echo "✅ Cluster '$CLUSTER_NAME' already exists."
 else
@@ -31,12 +35,21 @@ kubectl cluster-info --context kind-$CLUSTER_NAME
 echo "⏳ Waiting for cluster nodes..."
 kubectl wait --for=condition=Ready nodes --all --timeout=60s
 
-# 3. Setup System Namespace
+# 4. Setup System Namespace
 echo "📦 Creating system namespace 'namespace-resizer-system'..."
 kubectl create ns namespace-resizer-system --dry-run=client -o yaml | kubectl apply -f -
 
-# 4. Initial Sync
+# 5. Initial Sync
 echo "------------------------------------------------"
+echo "🧹 Cleaning up resources in demo namespaces..."
+DEMO_NAMESPACES="demo-standard demo-custom demo-opt-out demo-burst demo-storage demo-dual-pressure demo-multi-burst"
+for ns in $DEMO_NAMESPACES; do
+    if kubectl get ns $ns &> /dev/null; then
+        echo "   - Cleaning $ns..."
+        kubectl delete deployment,statefulset,pod,pvc,resourcequota --all -n $ns --ignore-not-found --wait=true
+    fi
+done
+
 echo "🚀 Performing initial sync from $DEMO_REPO_PATH..."
 if [ -d "$DEMO_REPO_PATH" ]; then
     kubectl apply -R -f "$DEMO_REPO_PATH/managed-resources/resizer-demo/"
