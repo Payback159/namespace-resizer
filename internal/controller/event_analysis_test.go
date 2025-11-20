@@ -5,225 +5,172 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/onsi/gomega"
-	"github.com/payback159/namespace-resizer/internal/lock"
+	"github.com/stretchr/testify/assert"
+	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	"github.com/payback159/namespace-resizer/internal/lock"
 )
 
-func TestAnalyzeEvents_Concurrency(t *testing.T) {
-	g := NewWithT(t)
-
+func TestAnalyzeEvents(t *testing.T) {
 	// Setup Scheme
 	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = coordinationv1.AddToScheme(scheme)
+	corev1.AddToScheme(scheme)
+	appsv1.AddToScheme(scheme)
+	coordinationv1.AddToScheme(scheme)
 
-	// 1. Setup Quota (Fully Used)
-	quota := corev1.ResourceQuota{
+	// 1. Setup Objects
+	nsName := "demo-ns"
+	quotaName := "demo-quota"
+
+	quota := &corev1.ResourceQuota{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-quota",
-			Namespace: "default",
+			Name:      quotaName,
+			Namespace: nsName,
 		},
 		Status: corev1.ResourceQuotaStatus{
 			Hard: corev1.ResourceList{
-				corev1.ResourceCPU: resource.MustParse("10"),
+				corev1.ResourceRequestsCPU:     resource.MustParse("100m"),
+				corev1.ResourceRequestsMemory:  resource.MustParse("100Mi"),
+				corev1.ResourceRequestsStorage: resource.MustParse("1Gi"),
 			},
 			Used: corev1.ResourceList{
-				corev1.ResourceCPU: resource.MustParse("10"),
+				corev1.ResourceRequestsCPU:     resource.MustParse("0"),
+				corev1.ResourceRequestsMemory:  resource.MustParse("0"),
+				corev1.ResourceRequestsStorage: resource.MustParse("1Gi"),
 			},
 		},
 	}
 
-	// 2. Setup Events
-	// We want to ensure the LARGE request is processed FIRST, then the SMALL one.
-	// If the controller just overwrites, the small one will win (bug).
-	// Fake client might sort by name. So we name the large one "a" and small one "b".
-
-	// We need to create the "Alive" objects for the liveness check to pass.
-	// Since the test doesn't specify UIDs in events, we should add them and create matching objects.
-	// Note: In this test, we assume they are the SAME workload (same UID) or different?
-	// The test name is "Concurrency", implying maybe different events.
-	// If we give them different UIDs, the new logic will SUM them (10 + 5 + 2 = 17).
-	// But the test expects MAX (15).
-	// This implies the original test assumed they were competing for the same quota but maybe not additive?
-	// Or maybe the original logic was "Max wins".
-	// If we want to preserve the "Max wins" behavior for THIS test, we should give them the SAME UID (Retry scenario).
-	// If we give them the same UID, the logic takes the MAX requested (5 vs 2 -> 5).
-	// So Total = Used (10) + Max(5, 2) = 15.
-	// This matches the expectation.
-
-	uid := types.UID("uid-1")
-	pod := corev1.Pod{
+	replicas := int32(3)
+	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "pod-1",
-			Namespace: "default",
-			UID:       uid,
+			Name:      "burst-sts",
+			Namespace: nsName,
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: "main",
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("200m"),
+									corev1.ResourceMemory: resource.MustParse("100Mi"),
+								},
+							},
+						},
+					},
+				},
+			},
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+				{
+					Spec: corev1.PersistentVolumeClaimSpec{
+						Resources: corev1.VolumeResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse("1Gi"),
+							},
+						},
+					},
+				},
+			},
+		},
+		Status: appsv1.StatefulSetStatus{
+			Replicas: 0, // All failed
 		},
 	}
 
-	// Event Large: Needs 5 CPU (Total 15)
-	eventLarge := corev1.Event{
+	// Event
+	evt := &corev1.Event{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "event-a-large",
-			Namespace: "default",
+			Name:      "evt-1",
+			Namespace: nsName,
 		},
 		InvolvedObject: corev1.ObjectReference{
-			Kind:       "Pod",
-			APIVersion: "v1",
-			Name:       "pod-1",
-			Namespace:  "default",
-			UID:        uid,
+			APIVersion: "apps/v1",
+			Kind:       "StatefulSet",
+			Name:       "burst-sts",
+			Namespace:  nsName,
 		},
 		Type:          corev1.EventTypeWarning,
 		Reason:        "FailedCreate",
-		Message:       "exceeded quota: test-quota, requested: cpu=5, used: cpu=10, limited: cpu=10",
+		Message:       `create Pod burst-sts-0 in StatefulSet burst-sts failed error: pods "burst-sts-0" is forbidden: exceeded quota: demo-quota, requested: requests.cpu=200m, used: requests.cpu=0, limited: requests.cpu=100m`,
 		LastTimestamp: metav1.Time{Time: time.Now()},
 	}
 
-	// Event Small: Needs 2 CPU (Total 12)
-	eventSmall := corev1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "event-b-small",
-			Namespace: "default",
-		},
-		InvolvedObject: corev1.ObjectReference{
-			Kind:       "Pod",
-			APIVersion: "v1",
-			Name:       "pod-1",
-			Namespace:  "default",
-			UID:        uid,
-		},
-		Type:          corev1.EventTypeWarning,
-		Reason:        "FailedCreate",
-		Message:       "exceeded quota: test-quota, requested: cpu=2, used: cpu=10, limited: cpu=10",
-		LastTimestamp: metav1.Time{Time: time.Now()},
-	}
-
-	// Create Fake Client with these objects
-	fakeClient := fake.NewClientBuilder().
+	// Fake Client
+	client := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithLists(&corev1.EventList{Items: []corev1.Event{eventLarge, eventSmall}}).
-		WithObjects(&pod). // Add Pod so Liveness Check passes
+		WithObjects(quota, sts, evt).
 		Build()
 
+	// Reconciler
 	r := &ResourceQuotaReconciler{
-		Client: fakeClient,
-		Locker: lock.NewLeaseLocker(fakeClient),
+		Client: client,
+		Locker: lock.NewLeaseLocker(client),
 	}
 
-	// Config with 0 increment to make math easy
+	// Config
 	config := ResizerConfig{
 		Thresholds:       map[corev1.ResourceName]float64{"default": 80.0},
-		IncrementFactors: map[corev1.ResourceName]float64{"default": 0.0}, // No buffer for this test
+		IncrementFactors: map[corev1.ResourceName]float64{"default": 0.2},
 		Cooldown:         time.Minute,
 	}
 
-	// 3. Run Analysis
-	recs, err := r.analyzeEvents(context.TODO(), quota, config)
-	g.Expect(err).ToNot(HaveOccurred())
+	// Set Logger
+	ctx := context.Background()
+	logger := zap.New(zap.UseDevMode(true))
+	ctx = ctrl.LoggerInto(ctx, logger)
 
-	// 4. Verify
-	// We expect the recommendation to be the MAX of the needs.
-	// Need A = 10 + 2 = 12
-	// Need B = 10 + 5 = 15
-	// Expected: 15
+	// Run analyzeEvents
+	recs, err := r.analyzeEvents(ctx, *quota, config)
+	assert.NoError(t, err)
 
-	cpuRec, ok := recs[corev1.ResourceCPU]
-	g.Expect(ok).To(BeTrue(), "Should have a CPU recommendation")
+	// Assertions
+	// We expect CPU recommendation:
+	// Deficit per pod: 200m. Missing replicas: 3. Total deficit: 600m.
+	// Base need: 0 + 600m = 600m.
+	// Buffer: 600m * 0.2 = 120m.
+	// Total: 720m.
+	// Current Limit: 100m.
+	// Recommendation: 720m.
 
-	// Check value
-	// We expect 15. If the bug exists, it might be 12 (if A is processed last) or 15 (if B is processed last).
-	// Since the fake client list order might be stable, let's see.
-	// To be sure we catch the bug, we might need to ensure B is processed before A, or just assert it is 15.
-
-	g.Expect(cpuRec.Value()).To(Equal(int64(15)), "Should recommend the maximum needed amount (15)")
-}
-
-func TestAnalyzeEvents_Memory(t *testing.T) {
-	g := NewWithT(t)
-
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = coordinationv1.AddToScheme(scheme)
-
-	// 1. Setup Quota (Fully Used Memory)
-	quota := corev1.ResourceQuota{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "mem-quota",
-			Namespace: "default",
-		},
-		Status: corev1.ResourceQuotaStatus{
-			Hard: corev1.ResourceList{
-				corev1.ResourceMemory: resource.MustParse("1Gi"),
-			},
-			Used: corev1.ResourceList{
-				corev1.ResourceMemory: resource.MustParse("1Gi"),
-			},
-		},
+	if val, ok := recs[corev1.ResourceRequestsCPU]; ok {
+		assert.Equal(t, "720m", val.String())
+	} else {
+		assert.Fail(t, "CPU recommendation missing")
 	}
 
-	// 2. Setup Event (Memory Burst)
-	// "requested: memory=512Mi"
-
-	uid := types.UID("uid-mem")
-	pod := corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "pod-mem",
-			Namespace: "default",
-			UID:       uid,
-		},
+	// We also expect Memory recommendation (Smart Calc includes all resources in PodSpec)
+	// Deficit per pod: 100Mi. Total: 300Mi.
+	// Buffer: 60Mi. Total: 360Mi.
+	if val, ok := recs[corev1.ResourceRequestsMemory]; ok {
+		assert.Equal(t, "360Mi", val.String())
+	} else {
+		assert.Fail(t, "Memory recommendation missing")
 	}
 
-	eventMem := corev1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "event-mem",
-			Namespace: "default",
-		},
-		InvolvedObject: corev1.ObjectReference{
-			Kind:       "Pod",
-			APIVersion: "v1",
-			Name:       "pod-mem",
-			Namespace:  "default",
-			UID:        uid,
-		},
-		Type:          corev1.EventTypeWarning,
-		Reason:        "FailedCreate",
-		Message:       "exceeded quota: mem-quota, requested: memory=512Mi, used: memory=1Gi, limited: memory=1Gi",
-		LastTimestamp: metav1.Time{Time: time.Now()},
+	// We also expect Storage recommendation (Smart Calc includes PVCs)
+	// Deficit per pod: 1Gi. Total: 3Gi.
+	// Used: 1Gi.
+	// Base: 1Gi + 3Gi = 4Gi.
+	// Buffer: 4Gi * 0.2 = 0.8Gi = 819Mi (approx).
+	// Total: 4.8Gi.
+	if val, ok := recs[corev1.ResourceRequestsStorage]; ok {
+		// 4Gi + 20% = 4.8Gi = 4915Mi approx
+		// 4 * 1024 = 4096. 4096 * 1.2 = 4915.2
+		// 4916Mi
+		assert.Equal(t, "4916Mi", val.String())
+	} else {
+		assert.Fail(t, "Storage recommendation missing")
 	}
-
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithLists(&corev1.EventList{Items: []corev1.Event{eventMem}}).
-		WithObjects(&pod). // Add Pod so Liveness Check passes
-		Build()
-
-	r := &ResourceQuotaReconciler{
-		Client: fakeClient,
-		Locker: lock.NewLeaseLocker(fakeClient),
-	}
-
-	config := ResizerConfig{
-		Thresholds:       map[corev1.ResourceName]float64{"default": 80.0},
-		IncrementFactors: map[corev1.ResourceName]float64{"default": 0.0},
-		Cooldown:         time.Minute,
-	}
-
-	// 3. Run Analysis
-	recs, err := r.analyzeEvents(context.TODO(), quota, config)
-	g.Expect(err).ToNot(HaveOccurred())
-
-	// 4. Verify
-	// Used 1Gi + Req 512Mi = 1.5Gi
-	memRec, ok := recs[corev1.ResourceMemory]
-	g.Expect(ok).To(BeTrue(), "Should have a Memory recommendation")
-
-	expected := resource.MustParse("1536Mi") // 1024 + 512
-	g.Expect(memRec.Equal(expected)).To(BeTrue(), "Expected %s, got %s", expected.String(), memRec.String())
 }

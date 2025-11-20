@@ -386,6 +386,119 @@ spec:
             cpu: "300m" # 300+300 = 600 > 500 -> Resize
 EOF
 
+# ==========================================
+# 8. Demo StatefulSet Burst
+# ==========================================
+DIR="$BASE_DIR/demo-statefulset-burst"
+mkdir -p "$DIR"
+
+cat <<EOF > "$DIR/namespace.yaml"
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-statefulset-burst
+  annotations:
+    resizer.io/enabled: "true"
+EOF
+
+cat <<EOF > "$DIR/quota.yaml"
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: sts-burst-quota
+  namespace: demo-statefulset-burst
+spec:
+  hard:
+    requests.cpu: "100m"
+    requests.memory: "100Mi"
+    requests.storage: "1Gi"
+EOF
+
+cat <<EOF > "$DIR/statefulset.yaml"
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: burst-sts
+  namespace: demo-statefulset-burst
+spec:
+  serviceName: "burst"
+  replicas: 3
+  selector:
+    matchLabels:
+      app: burst
+  template:
+    metadata:
+      labels:
+        app: burst
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "100Mi"
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi
+EOF
+
+# ==========================================
+# 9. Demo ReplicaSet Burst
+# ==========================================
+DIR="$BASE_DIR/demo-replicaset-burst"
+mkdir -p "$DIR"
+
+cat <<EOF > "$DIR/namespace.yaml"
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-replicaset-burst
+  annotations:
+    resizer.io/enabled: "true"
+EOF
+
+cat <<EOF > "$DIR/quota.yaml"
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: rs-burst-quota
+  namespace: demo-replicaset-burst
+spec:
+  hard:
+    requests.cpu: "150m"
+EOF
+
+cat <<EOF > "$DIR/replicaset.yaml"
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: burst-rs
+  namespace: demo-replicaset-burst
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: burst
+  template:
+    metadata:
+      labels:
+        app: burst
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "50Mi"
+EOF
+
 echo "✅ Files recreated."
 
 # Git Operations

@@ -42,7 +42,7 @@ kubectl create ns namespace-resizer-system --dry-run=client -o yaml | kubectl ap
 # 5. Initial Sync
 echo "------------------------------------------------"
 echo "🧹 Cleaning up resources in demo namespaces..."
-DEMO_NAMESPACES="demo-standard demo-custom demo-opt-out demo-burst demo-storage demo-dual-pressure demo-multi-burst"
+DEMO_NAMESPACES="demo-standard demo-custom demo-opt-out demo-burst demo-storage demo-dual-pressure demo-multi-burst demo-statefulset-burst demo-replicaset-burst"
 for ns in $DEMO_NAMESPACES; do
     if kubectl get ns $ns &> /dev/null; then
         echo "   - Cleaning $ns..."

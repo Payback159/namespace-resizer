@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"text/template"
@@ -336,72 +335,74 @@ func generatePRBody(ns, quota string, limits map[corev1.ResourceName]resource.Qu
 }
 
 func applyChangesToYaml(content string, limits map[corev1.ResourceName]resource.Quantity) string {
-	decoder := yaml.NewDecoder(strings.NewReader(content))
-	var buf bytes.Buffer
-	encoder := yaml.NewEncoder(&buf)
-	encoder.SetIndent(2)
-
-	for {
-		var node yaml.Node
-		if err := decoder.Decode(&node); err != nil {
-			if err == io.EOF {
-				break
-			}
-			// Fallback to naive implementation if parsing fails
-			return applyChangesToYamlNaive(content, limits)
-		}
-
-		// Walk the AST to find spec.hard fields
-		updateYamlNode(&node, limits)
-
-		if err := encoder.Encode(&node); err != nil {
-			return applyChangesToYamlNaive(content, limits)
-		}
-	}
-
-	err := encoder.Close()
-	if err != nil {
+	var node yaml.Node
+	if err := yaml.Unmarshal([]byte(content), &node); err != nil {
 		return applyChangesToYamlNaive(content, limits)
 	}
 
-	return buf.String()
-}
-
-func updateYamlNode(node *yaml.Node, limits map[corev1.ResourceName]resource.Quantity) {
-	// Recursive walk
-	if node.Kind == yaml.DocumentNode {
-		for _, child := range node.Content {
-			updateYamlNode(child, limits)
+	// Helper to find a value node for a given key in a mapping node
+	var findValueNode func(n *yaml.Node, key string) *yaml.Node
+	findValueNode = func(n *yaml.Node, key string) *yaml.Node {
+		if n.Kind == yaml.DocumentNode && len(n.Content) > 0 {
+			return findValueNode(n.Content[0], key)
 		}
-		return
-	}
-
-	if node.Kind == yaml.MappingNode {
-		// Check if we are in "spec" -> "hard"
-		// This is a simplified traversal. A robust one would track path context.
-		// For now, we just look for keys that match our resources ANYWHERE in the file
-		// which is safer than the string replace but still heuristic.
-		// Ideally, we should verify we are under spec.hard.
-
-		for i := 0; i < len(node.Content); i += 2 {
-			keyNode := node.Content[i]
-			valNode := node.Content[i+1]
-
-			if keyNode.Kind == yaml.ScalarNode {
-				// Check if this key matches any of our resources
-				for res, qty := range limits {
-					if matchesResourceKey(keyNode.Value, res) {
-						// Update the value node
-						valNode.Value = qty.String()
-						valNode.Style = yaml.DoubleQuotedStyle // Force quotes for safety (e.g. "100m")
-					}
+		if n.Kind == yaml.MappingNode {
+			for i := 0; i < len(n.Content); i += 2 {
+				if n.Content[i].Value == key {
+					return n.Content[i+1]
 				}
 			}
-
-			// Recurse into value (e.g. to find nested keys)
-			updateYamlNode(valNode, limits)
 		}
+		return nil
 	}
+
+	// Navigate to spec -> hard
+	specNode := findValueNode(&node, "spec")
+	if specNode != nil {
+		hardNode := findValueNode(specNode, "hard")
+		if hardNode != nil && hardNode.Kind == yaml.MappingNode {
+			// We are in 'hard' map
+			for res, qty := range limits {
+				found := false
+				// Try to find and update existing key
+				for i := 0; i < len(hardNode.Content); i += 2 {
+					keyNode := hardNode.Content[i]
+					valNode := hardNode.Content[i+1]
+					if matchesResourceKey(keyNode.Value, res) {
+						valNode.Value = qty.String()
+						valNode.Style = yaml.DoubleQuotedStyle
+						found = true
+						break
+					}
+				}
+
+				// If not found, append new key-value pair
+				if !found {
+					keyNode := &yaml.Node{
+						Kind:  yaml.ScalarNode,
+						Value: string(res),
+					}
+					valNode := &yaml.Node{
+						Kind:  yaml.ScalarNode,
+						Value: qty.String(),
+						Style: yaml.DoubleQuotedStyle,
+					}
+					hardNode.Content = append(hardNode.Content, keyNode, valNode)
+				}
+			}
+		}
+	} else {
+		// Fallback if structure is unexpected
+		return applyChangesToYamlNaive(content, limits)
+	}
+
+	var buf bytes.Buffer
+	encoder := yaml.NewEncoder(&buf)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(&node); err != nil {
+		return applyChangesToYamlNaive(content, limits)
+	}
+	return buf.String()
 }
 
 func matchesResourceKey(key string, res corev1.ResourceName) bool {
@@ -411,11 +412,11 @@ func matchesResourceKey(key string, res corev1.ResourceName) bool {
 	// Handle short names
 	switch res {
 	case corev1.ResourceRequestsCPU:
-		return key == "cpu"
+		return key == "cpu" || key == "requests.cpu"
 	case corev1.ResourceRequestsMemory:
-		return key == "memory"
+		return key == "memory" || key == "requests.memory"
 	case corev1.ResourceRequestsStorage:
-		return key == "storage"
+		return key == "storage" || key == "requests.storage"
 	}
 	return false
 }
