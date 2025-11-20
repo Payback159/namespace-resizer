@@ -110,19 +110,25 @@ func TestAutoMerge(t *testing.T) {
 
 	// Case 5: Global True, No Annotation, PR Blocked (Reviews) -> Merge (Bypass)
 	t.Run("PR Blocked by Reviews (Bypass)", func(t *testing.T) {
-		fakeGit := runReconcile(true, "", &git.PRStatus{IsOpen: true, Mergeable: true, MergeableState: "blocked", ChecksState: "success"})
+		fakeGit := runReconcile(true, "", &git.PRStatus{IsOpen: true, Mergeable: true, MergeableState: "blocked", ChecksState: "success", ChecksTotalCount: 1})
 		g.Expect(fakeGit.MergedPRID).To(Equal(123))
 	})
 
 	// Case 6: Global True, No Annotation, PR Blocked by CI -> No Merge
 	t.Run("PR Blocked by CI", func(t *testing.T) {
-		fakeGit := runReconcile(true, "", &git.PRStatus{IsOpen: true, Mergeable: true, MergeableState: "blocked", ChecksState: "failure"})
+		fakeGit := runReconcile(true, "", &git.PRStatus{IsOpen: true, Mergeable: true, MergeableState: "blocked", ChecksState: "failure", ChecksTotalCount: 1})
 		g.Expect(fakeGit.MergedPRID).To(Equal(0))
 	})
 
 	// Case 7: Global True, No Annotation, PR Unstable -> No Merge
 	t.Run("PR Unstable", func(t *testing.T) {
-		fakeGit := runReconcile(true, "", &git.PRStatus{IsOpen: true, Mergeable: true, MergeableState: "unstable", ChecksState: "failure"})
+		fakeGit := runReconcile(true, "", &git.PRStatus{IsOpen: true, Mergeable: true, MergeableState: "unstable", ChecksState: "failure", ChecksTotalCount: 1})
 		g.Expect(fakeGit.MergedPRID).To(Equal(0))
+	})
+
+	// Case 8: Global True, No Annotation, PR Blocked (Reviews) but No CI -> Merge (Bypass)
+	t.Run("PR Blocked by Reviews (No CI)", func(t *testing.T) {
+		fakeGit := runReconcile(true, "", &git.PRStatus{IsOpen: true, Mergeable: true, MergeableState: "blocked", ChecksState: "pending", ChecksTotalCount: 0})
+		g.Expect(fakeGit.MergedPRID).To(Equal(123))
 	})
 }

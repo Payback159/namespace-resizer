@@ -27,11 +27,12 @@ type Provider interface {
 }
 
 type PRStatus struct {
-	IsOpen         bool
-	IsMerged       bool
-	Mergeable      bool
-	MergeableState string
-	ChecksState    string
+	IsOpen           bool
+	IsMerged         bool
+	Mergeable        bool
+	MergeableState   string
+	ChecksState      string
+	ChecksTotalCount int
 }
 
 type GitHubProvider struct {
@@ -108,19 +109,24 @@ func (g *GitHubProvider) GetPRStatus(ctx context.Context, prID int) (*PRStatus, 
 	}
 
 	var checksState string
+	var checksTotalCount int
 	if pr.Head != nil && pr.Head.SHA != nil {
 		status, _, err := g.client.Repositories.GetCombinedStatus(ctx, g.owner, g.repo, *pr.Head.SHA, nil)
 		if err == nil {
 			checksState = status.GetState()
+			if status.TotalCount != nil {
+				checksTotalCount = *status.TotalCount
+			}
 		}
 	}
 
 	return &PRStatus{
-		IsOpen:         pr.GetState() == "open",
-		IsMerged:       pr.GetMerged(),
-		Mergeable:      pr.GetMergeable(),
-		MergeableState: pr.GetMergeableState(),
-		ChecksState:    checksState,
+		IsOpen:           pr.GetState() == "open",
+		IsMerged:         pr.GetMerged(),
+		Mergeable:        pr.GetMergeable(),
+		MergeableState:   pr.GetMergeableState(),
+		ChecksState:      checksState,
+		ChecksTotalCount: checksTotalCount,
 	}, nil
 }
 

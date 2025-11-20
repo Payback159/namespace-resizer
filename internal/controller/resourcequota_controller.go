@@ -196,12 +196,13 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				// We attempt to merge if the PR is mergeable (no git conflicts) AND
 				// either the state is clean OR the state is blocked but checks passed (meaning only reviews are blocking).
 				// We explicitly avoid merging if checks failed (Test Case failure).
+				// If ChecksTotalCount is 0, it means no CI is configured, so we treat it as "not failed".
 				canAttemptMerge := status.Mergeable &&
 					(status.MergeableState == "clean" ||
-						(status.MergeableState == "blocked" && status.ChecksState == "success"))
+						(status.MergeableState == "blocked" && (status.ChecksState == "success" || status.ChecksTotalCount == 0)))
 
 				if canAttemptMerge {
-					logger.Info("Auto-merging PR", "prID", prID, "state", status.MergeableState, "checks", status.ChecksState)
+					logger.Info("Auto-merging PR", "prID", prID, "state", status.MergeableState, "checks", status.ChecksState, "checksCount", status.ChecksTotalCount)
 					if err := r.GitProvider.MergePR(ctx, prID, "squash"); err != nil {
 						logger.Error(err, "failed to auto-merge PR")
 					} else {
@@ -213,7 +214,8 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 					logger.Info("Auto-merge enabled but PR is not ready",
 						"mergeable", status.Mergeable,
 						"state", status.MergeableState,
-						"checks", status.ChecksState)
+						"checks", status.ChecksState,
+						"checksCount", status.ChecksTotalCount)
 				}
 			}
 
