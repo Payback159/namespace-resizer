@@ -17,6 +17,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
+var ErrFileNotFound = errors.New("file not found")
+
 type Provider interface {
 	GetPRStatus(ctx context.Context, prID int) (*PRStatus, error)
 	CreatePR(ctx context.Context, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error)
@@ -325,5 +327,3 @@ func applyChangesToYaml(content string, limits map[corev1.ResourceName]resource.
 	}
 	return strings.Join(lines, "\n")
 }
-
-var ErrFileNotFound = errors.New("file not found")

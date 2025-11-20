@@ -48,6 +48,12 @@ type ResourceQuotaReconciler struct {
 	Locker      *lock.LeaseLocker
 }
 
+type ResizerConfig struct {
+	Thresholds       map[corev1.ResourceName]float64
+	IncrementFactors map[corev1.ResourceName]float64
+	Cooldown         time.Duration
+}
+
 // +kubebuilder:rbac:groups=core,resources=resourcequotas,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=resourcequotas/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core,resources=resourcequotas/finalizers,verbs=update
@@ -324,12 +330,6 @@ func (r *ResourceQuotaReconciler) analyzeEvents(ctx context.Context, quota corev
 		}
 	}
 	return recommendations, nil
-}
-
-type ResizerConfig struct {
-	Thresholds       map[corev1.ResourceName]float64
-	IncrementFactors map[corev1.ResourceName]float64
-	Cooldown         time.Duration
 }
 
 func (c ResizerConfig) GetThreshold(res corev1.ResourceName) float64 {
