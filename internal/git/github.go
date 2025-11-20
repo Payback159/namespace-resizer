@@ -229,8 +229,19 @@ func (g *GitHubProvider) UpdatePR(ctx context.Context, prID int, quotaName, name
 		Committer: &github.CommitAuthor{Name: github.String("Namespace Resizer"), Email: github.String("bot@resizer.io")},
 	}
 	_, _, err = g.client.Repositories.UpdateFile(ctx, g.owner, g.repo, targetFile, opts)
+	if err != nil {
+		return fmt.Errorf("failed to update file: %w", err)
+	}
 
-	return err
+	// 5. Update PR Body
+	newBody := generatePRBody(namespace, quotaName, newLimits)
+	pr.Body = github.String(newBody)
+	_, _, err = g.client.PullRequests.Edit(ctx, g.owner, g.repo, prID, pr)
+	if err != nil {
+		return fmt.Errorf("failed to update PR body: %w", err)
+	}
+
+	return nil
 }
 
 func (g *GitHubProvider) findQuotaFile(ctx context.Context, basePath, ref, quotaName string) (string, *github.RepositoryContent, error) {
