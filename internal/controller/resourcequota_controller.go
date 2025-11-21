@@ -48,9 +48,8 @@ type ResourceQuotaReconciler struct {
 	EnableAutoMerge bool
 }
 
-// +kubebuilder:rbac:groups=core,resources=resourcequotas,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=resourcequotas/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=core,resources=resourcequotas/finalizers,verbs=update
+// +kubebuilder:rbac:groups=core,resources=resourcequotas,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=resourcequotas/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;list;watch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments;replicasets;statefulsets;daemonsets,verbs=get;list;watch
