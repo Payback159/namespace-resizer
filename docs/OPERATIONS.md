@@ -68,10 +68,6 @@ Solange ein PR für diesen Namespace offen ist, erstellt der Controller keinen n
 *   Prüfe, ob es in der letzten Stunde massive "Bursts" gab (viele fehlschlagende Pods gleichzeitig).
 *   Der Controller summiert den Bedarf aller *gleichzeitig* fehlschlagenden Workloads.
 
-### Szenario: "Der PR hat komische Werte (z.B. 1288490188800m)"
-
-*   Dies sollte in neueren Versionen behoben sein (Auto-Formatting auf Mi/Gi). Bitte Version prüfen.
-
 ## 6. Konfiguration (Annotations)
 
 Werte können pro Namespace angepasst werden:
