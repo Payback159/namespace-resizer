@@ -182,15 +182,17 @@ func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.R
 		logger.Info("PR is closed/merged, releasing lock", "prID", prID)
 
 		if status.IsMerged {
-			logger.Info("PR merged, updating last-modified timestamp", "timestamp", time.Now())
-			if err := r.Locker.SetLastModified(ctx, req.Namespace, quota.Name, time.Now()); err != nil {
-				logger.Error(err, "failed to set last-modified timestamp")
+			ts := time.Now()
+			logger.Info("PR merged, releasing lock and updating last-modified timestamp", "timestamp", ts)
+			if err := r.Locker.ReleaseLockWithTimestamp(ctx, req.Namespace, quota.Name, &ts); err != nil {
+				logger.Error(err, "failed to release lock")
+				return ctrl.Result{}, err
 			}
-		}
-
-		if err := r.Locker.ReleaseLock(ctx, req.Namespace, quota.Name); err != nil {
-			logger.Error(err, "failed to release lock")
-			return ctrl.Result{}, err
+		} else {
+			if err := r.Locker.ReleaseLock(ctx, req.Namespace, quota.Name); err != nil {
+				logger.Error(err, "failed to release lock")
+				return ctrl.Result{}, err
+			}
 		}
 
 		// Requeue immediately to start fresh (check cooldown, etc.)
