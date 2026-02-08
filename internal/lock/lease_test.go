@@ -12,6 +12,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+const (
+	testNamespace = "default"
+	testQuotaName = "my-quota"
+)
+
 func TestLeaseLocker_Locking(t *testing.T) {
 	g := NewWithT(t)
 
@@ -22,8 +27,8 @@ func TestLeaseLocker_Locking(t *testing.T) {
 	locker := NewLeaseLocker(fakeClient)
 	ctx := context.TODO()
 
-	ns := "default"
-	quota := "my-quota"
+	ns := testNamespace
+	quota := testQuotaName
 	prID := 123
 
 	// 1. Test AcquireLock
@@ -62,8 +67,8 @@ func TestLeaseLocker_LastModified_Cooldown(t *testing.T) {
 	locker := NewLeaseLocker(fakeClient)
 	ctx := context.TODO()
 
-	ns := "default"
-	quota := "my-quota"
+	ns := testNamespace
+	quota := testQuotaName
 	duration := 1 * time.Hour
 
 	// 1. Check Cooldown (Should be false initially)
@@ -114,8 +119,8 @@ func TestLeaseLocker_ReleaseLockWithTimestamp(t *testing.T) {
 	locker := NewLeaseLocker(fakeClient)
 	ctx := context.TODO()
 
-	ns := "default"
-	quota := "my-quota"
+	ns := testNamespace
+	quota := testQuotaName
 	prID := 456
 
 	// 1. Acquire Lock
