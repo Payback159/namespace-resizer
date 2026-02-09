@@ -233,7 +233,7 @@ func main() {
 	// Check for Dry Run / Simulation Mode
 	if os.Getenv("DRY_RUN") == trueStr {
 		setupLog.Info("Using LogOnlyProvider (Dry Run / Simulation Mode)")
-		gitProvider = git.NewStatefulLogProvider(mgr.GetClient())
+		gitProvider = git.NewStatefulLogProvider()
 	} else if appID != 0 && installID != 0 && githubPrivateKey != "" {
 		setupLog.Info("Using GitHub App authentication")
 		gitProvider, errProvider = git.NewGitHubAppProvider(
