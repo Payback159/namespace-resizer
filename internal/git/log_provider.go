@@ -6,8 +6,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -68,14 +66,12 @@ type PRDetails struct {
 }
 
 type StatefulLogProvider struct {
-	client client.Client
-	prs    map[int]*PRDetails
+	prs map[int]*PRDetails
 }
 
-func NewStatefulLogProvider(k8sClient client.Client) *StatefulLogProvider {
+func NewStatefulLogProvider() *StatefulLogProvider {
 	return &StatefulLogProvider{
-		client: k8sClient,
-		prs:    make(map[int]*PRDetails),
+		prs: make(map[int]*PRDetails),
 	}
 }
 
@@ -130,31 +126,13 @@ func (p *StatefulLogProvider) MergePR(ctx context.Context, prID int, method stri
 		details.Status.IsMerged = true
 		logger.Info("StatefulLogProvider: Merged PR", "prID", prID, "newStatus", details.Status)
 
-		// Simulate GitOps Sync: Update the actual ResourceQuota in the cluster
-		if p.client != nil {
-			quota := &corev1.ResourceQuota{}
-			err := p.client.Get(ctx, types.NamespacedName{Name: details.QuotaName, Namespace: details.Namespace}, quota)
-			if err != nil {
-				logger.Error(err, "StatefulLogProvider: Failed to get ResourceQuota for sync", "namespace", details.Namespace, "name", details.QuotaName)
-				return err
-			}
-
-			// Update limits
-			if quota.Spec.Hard == nil {
-				quota.Spec.Hard = make(corev1.ResourceList)
-			}
-			for res, qty := range details.NewLimits {
-				quota.Spec.Hard[res] = qty
-			}
-
-			err = p.client.Update(ctx, quota)
-			if err != nil {
-				logger.Error(err, "StatefulLogProvider: Failed to update ResourceQuota (GitOps Sync)", "namespace", details.Namespace, "name", details.QuotaName)
-				return err
-			}
-			logger.Info("StatefulLogProvider: Successfully synced ResourceQuota (GitOps Simulation)", "namespace", details.Namespace, "name", details.QuotaName)
-		}
-
+		// Log what would be synced — actual sync is done by ArgoCD (or manually in E2E tests).
+		// DRY_RUN does not modify cluster resources.
+		logger.Info("StatefulLogProvider: DRY_RUN - would sync ResourceQuota",
+			"namespace", details.Namespace,
+			"name", details.QuotaName,
+			"newLimits", details.NewLimits,
+		)
 	} else {
 		logger.Info("StatefulLogProvider: PR not found for merge", "prID", prID)
 	}
