@@ -383,9 +383,11 @@ spec:
 			}, 1*time.Minute, 5*time.Second).Should(ContainSubstring("exceeded quota"))
 
 			// 4. Watch logs for "GitOps Simulation: Merging PR"
+			// Note: kubectl logs -l defaults to --tail=10, so we must use --tail=-1
+			// to get all log lines, otherwise the merge logs may be truncated.
 			By("waiting for controller to simulate PR merge")
 			Eventually(func() string {
-				cmd := exec.Command("kubectl", "logs", "-l", "control-plane=controller-manager", "-n", namespace)
+				cmd := exec.Command("kubectl", "logs", "-l", "control-plane=controller-manager", "--tail=-1", "-n", namespace)
 				out, _ := utils.Run(cmd)
 				return out
 			}, 2*time.Minute, 5*time.Second).Should(SatisfyAny(
