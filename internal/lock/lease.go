@@ -117,11 +117,27 @@ func (l *LeaseLocker) UpdateLock(ctx context.Context, targetNS, quotaName string
 
 // ReleaseLock releases the lock by clearing the HolderIdentity, but keeps the Lease object.
 func (l *LeaseLocker) ReleaseLock(ctx context.Context, targetNS, quotaName string) error {
+	return l.ReleaseLockWithTimestamp(ctx, targetNS, quotaName, nil)
+}
+
+// ReleaseLockWithTimestamp releases the lock and optionally sets the last-modified
+// timestamp in a single atomic update. This avoids optimistic concurrency conflicts
+// that occur when SetLastModified and ReleaseLock are called sequentially, because
+// the cached client may return a stale resourceVersion on the second Get.
+func (l *LeaseLocker) ReleaseLockWithTimestamp(ctx context.Context, targetNS, quotaName string, timestamp *time.Time) error {
 	leaseName := l.getLeaseName(targetNS, quotaName)
 	var lease coordinationv1.Lease
 
 	if err := l.client.Get(ctx, client.ObjectKey{Name: leaseName, Namespace: ControllerNamespace}, &lease); err != nil {
 		return client.IgnoreNotFound(err)
+	}
+
+	// Set timestamp if provided
+	if timestamp != nil {
+		if lease.Annotations == nil {
+			lease.Annotations = make(map[string]string)
+		}
+		lease.Annotations[AnnotationLastModified] = timestamp.Format(time.RFC3339)
 	}
 
 	// Clear identity to release lock

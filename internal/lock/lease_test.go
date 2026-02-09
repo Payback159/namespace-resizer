@@ -12,6 +12,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+const (
+	testNamespace = "default"
+	testQuotaName = "my-quota"
+)
+
 func TestLeaseLocker_Locking(t *testing.T) {
 	g := NewWithT(t)
 
@@ -22,8 +27,8 @@ func TestLeaseLocker_Locking(t *testing.T) {
 	locker := NewLeaseLocker(fakeClient)
 	ctx := context.TODO()
 
-	ns := "default"
-	quota := "my-quota"
+	ns := testNamespace
+	quota := testQuotaName
 	prID := 123
 
 	// 1. Test AcquireLock
@@ -62,8 +67,8 @@ func TestLeaseLocker_LastModified_Cooldown(t *testing.T) {
 	locker := NewLeaseLocker(fakeClient)
 	ctx := context.TODO()
 
-	ns := "default"
-	quota := "my-quota"
+	ns := testNamespace
+	quota := testQuotaName
 	duration := 1 * time.Hour
 
 	// 1. Check Cooldown (Should be false initially)
@@ -102,4 +107,48 @@ func TestLeaseLocker_LastModified_Cooldown(t *testing.T) {
 	// Verify Lease still exists
 	err = fakeClient.Get(ctx, client.ObjectKey{Name: leaseName, Namespace: ControllerNamespace}, &lease)
 	g.Expect(err).ToNot(HaveOccurred())
+}
+
+func TestLeaseLocker_ReleaseLockWithTimestamp(t *testing.T) {
+	g := NewWithT(t)
+
+	// Setup
+	scheme := runtime.NewScheme()
+	_ = coordinationv1.AddToScheme(scheme)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	locker := NewLeaseLocker(fakeClient)
+	ctx := context.TODO()
+
+	ns := testNamespace
+	quota := testQuotaName
+	prID := 456
+
+	// 1. Acquire Lock
+	err := locker.AcquireLock(ctx, ns, quota, prID)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	// 2. Verify Lock is held
+	id, err := locker.GetLock(ctx, ns, quota)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(id).To(Equal(prID))
+
+	// 3. Release Lock with timestamp (single atomic operation)
+	ts := time.Now()
+	err = locker.ReleaseLockWithTimestamp(ctx, ns, quota, &ts)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	// 4. Verify Lock is released
+	id, err = locker.GetLock(ctx, ns, quota)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(id).To(Equal(0))
+
+	// 5. Verify Timestamp was set
+	lastMod, err := locker.GetLastModified(ctx, ns, quota)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(lastMod.Format(time.RFC3339)).To(Equal(ts.Format(time.RFC3339)))
+
+	// 6. Verify Cooldown is active
+	active, err := locker.CheckCooldown(ctx, ns, quota, 1*time.Hour)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(active).To(BeTrue())
 }

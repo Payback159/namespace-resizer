@@ -22,9 +22,9 @@ import (
 func TestAnalyzeEvents(t *testing.T) {
 	// Setup Scheme
 	scheme := runtime.NewScheme()
-	corev1.AddToScheme(scheme)
-	appsv1.AddToScheme(scheme)
-	coordinationv1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = coordinationv1.AddToScheme(scheme)
 
 	// 1. Setup Objects
 	nsName := "demo-ns"
