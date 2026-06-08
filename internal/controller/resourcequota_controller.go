@@ -213,14 +213,25 @@ func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.R
 		}
 
 		canAttemptMerge := status.Mergeable &&
-			(status.MergeableState == "clean" ||
-				(status.MergeableState == "blocked" && (status.ChecksState == "success" || status.ChecksTotalCount == 0)))
+			(status.MergeableState == git.MergeableStateClean ||
+				(status.MergeableState == git.MergeableStateBlocked && (status.ChecksState == git.ChecksStateSuccess || status.ChecksTotalCount == 0)))
 
 		if canAttemptMerge {
 			logger.Info("Auto-merging PR", "prID", prID, "state", status.MergeableState, "checks", status.ChecksState, "checksCount", status.ChecksTotalCount)
 			if err := r.GitProvider.MergePR(ctx, prID, "squash"); err != nil {
 				logger.Error(err, "failed to auto-merge PR")
 			} else {
+				// The merge succeeded, so we release the lock and record the
+				// last-modified timestamp right away. Relying on a follow-up
+				// GetPRStatus call would be racy: GitHub may still report the PR as
+				// open for a short window, causing the controller to attempt a
+				// second merge on the next reconcile.
+				ts := time.Now()
+				if err := r.Locker.ReleaseLockWithTimestamp(ctx, req.Namespace, quota.Name, &ts); err != nil {
+					logger.Error(err, "failed to release lock after merge")
+					return ctrl.Result{}, err
+				}
+				logger.Info("PR auto-merged and lock released", "prID", prID)
 				return ctrl.Result{Requeue: true}, nil
 			}
 		} else {
@@ -253,6 +264,27 @@ func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.R
 // handleNewProposal manages the creation of new Pull Requests
 func (r *ResourceQuotaReconciler) handleNewProposal(ctx context.Context, req ctrl.Request, quota corev1.ResourceQuota, ns corev1.Namespace, config ResizerConfig, recommendations map[corev1.ResourceName]resource.Quantity) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	// 0. Recover orphaned PRs before creating a new one.
+	// A PR may have been created in a previous reconcile where the subsequent
+	// AcquireLock failed (transient API error, optimistic-concurrency conflict,
+	// or a controller restart between CreatePR and AcquireLock). That leaves an
+	// open PR with no lock recorded. Without this check the controller would open
+	// a brand-new duplicate PR on every reconcile.
+	existingPRID, err := r.GitProvider.FindOpenPR(ctx, req.Namespace, quota.Name)
+	if err != nil {
+		logger.Error(err, "failed to check for existing open PR")
+		return ctrl.Result{}, err
+	}
+	if existingPRID != 0 {
+		logger.Info("Found existing open PR without lock; adopting it instead of creating a duplicate", "prID", existingPRID)
+		if err := r.Locker.AcquireLock(ctx, req.Namespace, quota.Name, existingPRID); err != nil {
+			logger.Error(err, "failed to acquire lock for existing PR")
+			return ctrl.Result{}, err
+		}
+		// Requeue so the next pass manages the now-locked PR (status/update/merge).
+		return ctrl.Result{Requeue: true}, nil
+	}
 
 	// 1. Detect No-Op
 	isNoop := true
@@ -355,7 +387,7 @@ func (r *ResourceQuotaReconciler) analyzeEvents(ctx context.Context, quota corev
 			continue
 		}
 
-		if evt.Type != corev1.EventTypeWarning || evt.Reason != "FailedCreate" {
+		if evt.Type != corev1.EventTypeWarning || evt.Reason != reasonFailedCreate {
 			continue
 		}
 
