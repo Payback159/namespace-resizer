@@ -54,6 +54,12 @@ func TestAutoMerge(t *testing.T) {
 
 	// Helper to run reconcile
 	runReconcile := func(enableGlobal bool, annotationVal string, prStatus *git.PRStatus) *FakeGitProvider {
+		// Ensure the lock is held by PR 123 at the start of each case. A
+		// successful auto-merge now releases the lock immediately, so resetting
+		// here keeps the sub-tests independent of execution order.
+		_ = locker.ReleaseLock(context.TODO(), nsName, quotaName)
+		g.Expect(locker.AcquireLock(context.TODO(), nsName, quotaName, 123)).To(Succeed())
+
 		// Update Namespace Annotation
 		if ns.Annotations == nil {
 			ns.Annotations = make(map[string]string)

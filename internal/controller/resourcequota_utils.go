@@ -37,6 +37,15 @@ import (
 
 const defaultKey = "default"
 
+// Kubernetes event reason and involved-object kinds handled by event analysis.
+const (
+	reasonFailedCreate = "FailedCreate"
+	kindStatefulSet    = "StatefulSet"
+	kindDaemonSet      = "DaemonSet"
+	kindReplicaSet     = "ReplicaSet"
+	kindPod            = "Pod"
+)
+
 type ResizerConfig struct {
 	Thresholds       map[corev1.ResourceName]float64
 	IncrementFactors map[corev1.ResourceName]float64
@@ -229,7 +238,7 @@ func (r *ResourceQuotaReconciler) mapEventToQuota(ctx context.Context, obj clien
 	}
 
 	// Filter for FailedCreate
-	if evt.Type != corev1.EventTypeWarning || evt.Reason != "FailedCreate" {
+	if evt.Type != corev1.EventTypeWarning || evt.Reason != reasonFailedCreate {
 		return nil
 	}
 
@@ -328,7 +337,7 @@ func (r *ResourceQuotaReconciler) calculateWorkloadDeficit(ctx context.Context, 
 	logger.Info("Calculating deficit", "kind", evt.InvolvedObject.Kind, "name", evt.InvolvedObject.Name, "failedRes", failedRes, "failedQty", failedQty)
 
 	switch evt.InvolvedObject.Kind {
-	case "StatefulSet":
+	case kindStatefulSet:
 		var sts appsv1.StatefulSet
 		if err := r.Get(ctx, types.NamespacedName{Name: evt.InvolvedObject.Name, Namespace: evt.InvolvedObject.Namespace}, &sts); err == nil {
 			if sts.Spec.Replicas != nil {
@@ -343,7 +352,7 @@ func (r *ResourceQuotaReconciler) calculateWorkloadDeficit(ctx context.Context, 
 			logger.Error(err, "Failed to get StatefulSet", "name", evt.InvolvedObject.Name)
 		}
 
-	case "DaemonSet":
+	case kindDaemonSet:
 		var ds appsv1.DaemonSet
 		if err := r.Get(ctx, types.NamespacedName{Name: evt.InvolvedObject.Name, Namespace: evt.InvolvedObject.Namespace}, &ds); err == nil {
 			desired := ds.Status.DesiredNumberScheduled
@@ -355,7 +364,7 @@ func (r *ResourceQuotaReconciler) calculateWorkloadDeficit(ctx context.Context, 
 			logger.Error(err, "Failed to get DaemonSet", "name", evt.InvolvedObject.Name)
 		}
 
-	case "ReplicaSet":
+	case kindReplicaSet:
 		var rs appsv1.ReplicaSet
 		if err := r.Get(ctx, types.NamespacedName{Name: evt.InvolvedObject.Name, Namespace: evt.InvolvedObject.Namespace}, &rs); err == nil {
 			if rs.Spec.Replicas != nil {
@@ -369,7 +378,7 @@ func (r *ResourceQuotaReconciler) calculateWorkloadDeficit(ctx context.Context, 
 			logger.Error(err, "Failed to get ReplicaSet", "name", evt.InvolvedObject.Name)
 		}
 
-	case "Pod":
+	case kindPod:
 		// Fallback for Pod events (e.g. if the event is on the Pod directly)
 		// Try to find the owner (StatefulSet, ReplicaSet, DaemonSet)
 		var pod corev1.Pod

@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
-	"github.com/google/go-github/v60/github"
+	"github.com/google/go-github/v75/github"
 	"golang.org/x/oauth2"
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
@@ -21,11 +21,23 @@ import (
 
 var ErrFileNotFound = errors.New("file not found")
 
+// GitHub pull request mergeable_state values that the auto-merge logic checks.
+const (
+	MergeableStateClean   = "clean"
+	MergeableStateBlocked = "blocked"
+	// ChecksStateSuccess is the GitHub combined commit status "success" state.
+	ChecksStateSuccess = "success"
+)
+
 type Provider interface {
 	GetPRStatus(ctx context.Context, prID int) (*PRStatus, error)
 	MergePR(ctx context.Context, prID int, method string) error
 	CreatePR(ctx context.Context, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error)
 	UpdatePR(ctx context.Context, prID int, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) error
+	// FindOpenPR returns the number of an existing open PR managed by the resizer
+	// for the given namespace/quota, or 0 if none exists. It is used to recover
+	// from orphaned PRs (created but never locked) and avoid opening duplicates.
+	FindOpenPR(ctx context.Context, namespace, quotaName string) (int, error)
 }
 
 type PRStatus struct {
@@ -114,11 +126,15 @@ func (g *GitHubProvider) GetPRStatus(ctx context.Context, prID int) (*PRStatus, 
 	var checksTotalCount int
 	if pr.Head != nil && pr.Head.SHA != nil {
 		status, _, err := g.client.Repositories.GetCombinedStatus(ctx, g.owner, g.repo, *pr.Head.SHA, nil)
-		if err == nil {
-			checksState = status.GetState()
-			if status.TotalCount != nil {
-				checksTotalCount = *status.TotalCount
-			}
+		if err != nil {
+			// Do not silently swallow this error: a failed status lookup would leave
+			// checksTotalCount at 0, which the auto-merge logic interprets as "no CI"
+			// and could bypass required checks. Surface it so the caller can retry.
+			return nil, fmt.Errorf("failed to get combined status for PR %d: %w", prID, err)
+		}
+		checksState = status.GetState()
+		if status.TotalCount != nil {
+			checksTotalCount = *status.TotalCount
 		}
 	}
 
@@ -155,11 +171,9 @@ func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace stri
 
 	// 2. Create new branch
 	branchName := fmt.Sprintf("resize/%s-%s-%d", namespace, quotaName, time.Now().Unix())
-	newRef := &github.Reference{
-		Ref: github.String("refs/heads/" + branchName),
-		Object: &github.GitObject{
-			SHA: baseRef.Object.SHA,
-		},
+	newRef := github.CreateRef{
+		Ref: "refs/heads/" + branchName,
+		SHA: baseRef.Object.GetSHA(),
 	}
 	_, _, err = g.client.Git.CreateRef(ctx, g.owner, g.repo, newRef)
 	if err != nil {
@@ -187,11 +201,11 @@ func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace stri
 
 	// 5. Commit changes
 	opts := &github.RepositoryContentFileOptions{
-		Message:   github.String(fmt.Sprintf("chore(%s): resize quota %s", namespace, quotaName)),
+		Message:   github.Ptr(fmt.Sprintf("chore(%s): resize quota %s", namespace, quotaName)),
 		Content:   []byte(newContent),
 		SHA:       fileContent.SHA,
-		Branch:    github.String(branchName),
-		Committer: &github.CommitAuthor{Name: github.String("Namespace Resizer"), Email: github.String("bot@resizer.io")},
+		Branch:    github.Ptr(branchName),
+		Committer: &github.CommitAuthor{Name: github.Ptr("Namespace Resizer"), Email: github.Ptr("bot@resizer.io")},
 	}
 	_, _, err = g.client.Repositories.UpdateFile(ctx, g.owner, g.repo, targetFile, opts)
 	if err != nil {
@@ -200,11 +214,11 @@ func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace stri
 
 	// 6. Create PR
 	newPR := &github.NewPullRequest{
-		Title:               github.String(fmt.Sprintf("Resize Quota %s in %s", quotaName, namespace)),
-		Head:                github.String(branchName),
-		Base:                github.String(repo.GetDefaultBranch()),
-		Body:                github.String(generatePRBody(namespace, quotaName, newLimits)),
-		MaintainerCanModify: github.Bool(true),
+		Title:               github.Ptr(fmt.Sprintf("Resize Quota %s in %s", quotaName, namespace)),
+		Head:                github.Ptr(branchName),
+		Base:                github.Ptr(repo.GetDefaultBranch()),
+		Body:                github.Ptr(generatePRBody(namespace, quotaName, newLimits)),
+		MaintainerCanModify: github.Ptr(true),
 	}
 
 	pr, _, err := g.client.PullRequests.Create(ctx, g.owner, g.repo, newPR)
@@ -257,11 +271,11 @@ func (g *GitHubProvider) UpdatePR(ctx context.Context, prID int, quotaName, name
 
 	// 4. Commit update
 	opts := &github.RepositoryContentFileOptions{
-		Message:   github.String(fmt.Sprintf("chore(%s): update quota resize %s", namespace, quotaName)),
+		Message:   github.Ptr(fmt.Sprintf("chore(%s): update quota resize %s", namespace, quotaName)),
 		Content:   []byte(newContent),
 		SHA:       fileContent.SHA,
-		Branch:    github.String(branchName),
-		Committer: &github.CommitAuthor{Name: github.String("Namespace Resizer"), Email: github.String("bot@resizer.io")},
+		Branch:    github.Ptr(branchName),
+		Committer: &github.CommitAuthor{Name: github.Ptr("Namespace Resizer"), Email: github.Ptr("bot@resizer.io")},
 	}
 	_, _, err = g.client.Repositories.UpdateFile(ctx, g.owner, g.repo, targetFile, opts)
 	if err != nil {
@@ -269,14 +283,45 @@ func (g *GitHubProvider) UpdatePR(ctx context.Context, prID int, quotaName, name
 	}
 
 	// 5. Update PR Body
+	// Only send the fields we intend to change. Passing the full PR object
+	// returned by Get would also marshal head/base/state, which the Edit endpoint
+	// rejects (422) because base must be a branch name, not an object.
 	newBody := generatePRBody(namespace, quotaName, newLimits)
-	pr.Body = github.String(newBody)
-	_, _, err = g.client.PullRequests.Edit(ctx, g.owner, g.repo, prID, pr)
+	update := &github.PullRequest{Body: github.Ptr(newBody)}
+	_, _, err = g.client.PullRequests.Edit(ctx, g.owner, g.repo, prID, update)
 	if err != nil {
 		return fmt.Errorf("failed to update PR body: %w", err)
 	}
 
 	return nil
+}
+
+// FindOpenPR lists open pull requests and returns the number of the one whose
+// head branch matches the deterministic resizer branch prefix for the given
+// namespace/quota. Returns 0 if no matching open PR exists.
+func (g *GitHubProvider) FindOpenPR(ctx context.Context, namespace, quotaName string) (int, error) {
+	prefix := fmt.Sprintf("resize/%s-%s-", namespace, quotaName)
+	opts := &github.PullRequestListOptions{
+		State:       "open",
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+
+	for {
+		prs, resp, err := g.client.PullRequests.List(ctx, g.owner, g.repo, opts)
+		if err != nil {
+			return 0, fmt.Errorf("failed to list pull requests: %w", err)
+		}
+		for _, pr := range prs {
+			if pr.Head != nil && strings.HasPrefix(pr.Head.GetRef(), prefix) {
+				return pr.GetNumber(), nil
+			}
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return 0, nil
 }
 
 func (g *GitHubProvider) findQuotaFile(ctx context.Context, basePath, ref, quotaName string) (string, *github.RepositoryContent, error) {
@@ -324,12 +369,12 @@ func (g *GitHubProvider) findQuotaFile(ctx context.Context, basePath, ref, quota
 
 func generatePRBody(ns, quota string, limits map[corev1.ResourceName]resource.Quantity) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("### Quota Resize Recommendation for `%s` in `%s`\n\n", quota, ns))
+	_, _ = fmt.Fprintf(&sb, "### Quota Resize Recommendation for `%s` in `%s`\n\n", quota, ns)
 	sb.WriteString("The Namespace Resizer Controller detected a need to increase the following limits:\n\n")
 	sb.WriteString("| Resource | New Limit |\n")
 	sb.WriteString("| :--- | :--- |\n")
 	for res, qty := range limits {
-		sb.WriteString(fmt.Sprintf("| %s | %s |\n", res, qty.String()))
+		_, _ = fmt.Fprintf(&sb, "| %s | %s |\n", res, qty.String())
 	}
 	sb.WriteString("\n\n*Generated automatically by Namespace Resizer*")
 	return sb.String()

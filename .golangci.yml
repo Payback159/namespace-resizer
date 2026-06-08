@@ -36,6 +36,11 @@ linters:
           - dupl
           - lll
         path: internal/*
+      # Test fixtures naturally repeat string literals (resource kinds, names,
+      # statuses); enforcing constants there adds noise without value.
+      - linters:
+          - goconst
+        path: _test\.go
     paths:
       - third_party$
       - builtin$
