@@ -273,9 +273,11 @@ func main() {
 	}
 
 	if err := (&controller.ResourceQuotaReconciler{
-		Client:          mgr.GetClient(),
-		Scheme:          mgr.GetScheme(),
-		Recorder:        mgr.GetEventRecorderFor("namespace-resizer"),
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		// GetEventRecorderFor returns the legacy record.EventRecorder. We keep it
+		// intentionally; migrating to the new events.EventRecorder API is tracked separately.
+		Recorder:        mgr.GetEventRecorderFor("namespace-resizer"), //nolint:staticcheck // legacy events API
 		GitProvider:     gitProvider,
 		Locker:          locker,
 		EnableAutoMerge: enableAutoMerge,
