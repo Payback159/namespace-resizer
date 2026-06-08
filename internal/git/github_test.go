@@ -9,7 +9,7 @@ import (
 	"testing"
 	"text/template"
 
-	"github.com/google/go-github/v60/github"
+	"github.com/google/go-github/v75/github"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
