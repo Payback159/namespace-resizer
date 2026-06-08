@@ -3,6 +3,7 @@ package git
 import (
 	"context"
 	"math/rand"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -25,8 +26,8 @@ func (p *LogOnlyProvider) GetPRStatus(ctx context.Context, prID int) (*PRStatus,
 		IsOpen:         true,
 		IsMerged:       false,
 		Mergeable:      true,
-		MergeableState: "clean",
-		ChecksState:    "success",
+		MergeableState: MergeableStateClean,
+		ChecksState:    ChecksStateSuccess,
 	}, nil
 }
 
@@ -57,6 +58,11 @@ func (p *LogOnlyProvider) MergePR(ctx context.Context, prID int, method string) 
 	return nil
 }
 
+// FindOpenPR always reports no existing PR for the stateless log provider.
+func (p *LogOnlyProvider) FindOpenPR(ctx context.Context, namespace, quotaName string) (int, error) {
+	return 0, nil
+}
+
 // StatefulLogProvider allows simulating state changes for the demo
 type PRDetails struct {
 	Namespace string
@@ -66,6 +72,7 @@ type PRDetails struct {
 }
 
 type StatefulLogProvider struct {
+	mu  sync.RWMutex
 	prs map[int]*PRDetails
 }
 
@@ -77,9 +84,18 @@ func NewStatefulLogProvider() *StatefulLogProvider {
 
 func (p *StatefulLogProvider) GetPRStatus(ctx context.Context, prID int) (*PRStatus, error) {
 	logger := log.FromContext(ctx)
-	if details, ok := p.prs[prID]; ok {
-		logger.Info("StatefulLogProvider: Found PR", "prID", prID, "status", details.Status)
-		return details.Status, nil
+	p.mu.RLock()
+	details, ok := p.prs[prID]
+	var statusCopy *PRStatus
+	if ok && details.Status != nil {
+		s := *details.Status
+		statusCopy = &s
+	}
+	p.mu.RUnlock()
+
+	if ok {
+		logger.Info("StatefulLogProvider: Found PR", "prID", prID, "status", statusCopy)
+		return statusCopy, nil
 	}
 	logger.Info("StatefulLogProvider: PR not found, returning default", "prID", prID)
 	// Default to open/clean
@@ -87,7 +103,7 @@ func (p *StatefulLogProvider) GetPRStatus(ctx context.Context, prID int) (*PRSta
 		IsOpen:         true,
 		IsMerged:       false,
 		Mergeable:      true,
-		MergeableState: "clean",
+		MergeableState: MergeableStateClean,
 	}, nil
 }
 
@@ -96,6 +112,7 @@ func (p *StatefulLogProvider) CreatePR(ctx context.Context, quotaName, namespace
 	id := rand.Intn(1000) + 1000
 	logger.Info("GitOps Simulation: Creating PR", "namespace", namespace, "quota", quotaName, "prID", id)
 
+	p.mu.Lock()
 	p.prs[id] = &PRDetails{
 		Namespace: namespace,
 		QuotaName: quotaName,
@@ -104,9 +121,10 @@ func (p *StatefulLogProvider) CreatePR(ctx context.Context, quotaName, namespace
 			IsOpen:         true,
 			IsMerged:       false,
 			Mergeable:      true,
-			MergeableState: "clean",
+			MergeableState: MergeableStateClean,
 		},
 	}
+	p.mu.Unlock()
 	logger.Info("StatefulLogProvider: Stored PR", "prID", id)
 	return id, nil
 }
@@ -117,13 +135,34 @@ func (p *StatefulLogProvider) UpdatePR(ctx context.Context, prID int, quotaName,
 	return nil
 }
 
+// FindOpenPR returns the number of a stored, still-open PR matching the given
+// namespace/quota, or 0 if none exists. This mirrors the GitHub provider so the
+// orphaned-PR recovery path can be exercised in dry-run/simulation mode.
+func (p *StatefulLogProvider) FindOpenPR(ctx context.Context, namespace, quotaName string) (int, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for id, details := range p.prs {
+		if details.Namespace == namespace && details.QuotaName == quotaName &&
+			details.Status != nil && details.Status.IsOpen {
+			return id, nil
+		}
+	}
+	return 0, nil
+}
+
 func (p *StatefulLogProvider) MergePR(ctx context.Context, prID int, method string) error {
 	logger := log.FromContext(ctx)
 	logger.Info("GitOps Simulation: Merging PR", "prID", prID)
 
-	if details, ok := p.prs[prID]; ok {
+	p.mu.Lock()
+	details, ok := p.prs[prID]
+	if ok {
 		details.Status.IsOpen = false
 		details.Status.IsMerged = true
+	}
+	p.mu.Unlock()
+
+	if ok {
 		logger.Info("StatefulLogProvider: Merged PR", "prID", prID, "newStatus", details.Status)
 
 		// Log what would be synced — actual sync is done by ArgoCD (or manually in E2E tests).
