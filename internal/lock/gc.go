@@ -58,12 +58,12 @@ func (gc *LeaseGarbageCollector) cleanup(ctx context.Context) error {
 	var leaseList coordinationv1.LeaseList
 	if err := gc.client.List(ctx, &leaseList,
 		client.InNamespace(ControllerNamespace),
-		client.MatchingLabels{"app.kubernetes.io/managed-by": "namespace-resizer"}); err != nil {
+		client.MatchingLabels{labelManagedBy: managedByValue}); err != nil {
 		return err
 	}
 
 	for _, lease := range leaseList.Items {
-		targetNS := lease.Labels["resizer.io/target-ns"]
+		targetNS := lease.Labels[labelTargetNS]
 		if targetNS == "" {
 			// Skip leases without target namespace label (should not happen for ours)
 			continue
