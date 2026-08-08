@@ -1392,10 +1392,15 @@ test cases carry over unchanged.
 - Create: `internal/sizing/deficit_test.go`
 - Modify: `internal/controller/resourcequota_utils.go` — delete the moved
   functions, call the `sizing` package instead
-- Delete: `internal/controller/limits_test.go`
-- Modify: `internal/controller/event_parser_test.go`,
-  `internal/controller/utils_test.go` — move the cases that cover moved
-  functions into `internal/sizing/deficit_test.go`
+- Delete: `internal/controller/limits_test.go` (covers `getPodRequests`) and
+  `internal/controller/event_parser_test.go` (covers `parseEventMessage`) —
+  both functions move, so their cases move with them
+- Leave alone: `internal/controller/utils_test.go` holds only
+  `TestConvertToReadableFormat`, which covers a function this task does not
+  touch. It is removed later, together with `convertToReadableFormat` itself.
+- Leave alone: `internal/controller/smart_calculation_test.go` covers
+  `calculateWorkloadDeficit`, which needs the Kubernetes client and stays in
+  the controller.
 
 **Interfaces:**
 - Consumes: nothing.
@@ -1429,11 +1434,17 @@ once.
 - [ ] **Step 2: Port the existing tests**
 
 Create `internal/sizing/deficit_test.go`. Move the test bodies from
-`internal/controller/limits_test.go` (`TestGetPodRequests_Limits`),
-`internal/controller/event_parser_test.go` and the workload-key cases in
-`internal/controller/utils_test.go`, renaming the calls to the exported
-functions. Change `package controller` to `package sizing` and drop imports
-that are no longer needed.
+`internal/controller/limits_test.go` (`TestGetPodRequests_Limits`) and
+`internal/controller/event_parser_test.go` (`TestParseEventMessage`),
+renaming the calls to the exported functions. Change `package controller` to
+`package sizing` and drop imports that are no longer needed.
+
+`WorkloadKey` and `PVCRequests` have no existing test. Add a small table for
+each: `WorkloadKey` covers the pod-suffix case (`app-a-6b474476c4-xfg2z` →
+`app-a-6b474476c4`), the StatefulSet case (`web-0` → `web`) and a name with
+no hyphen at all (returned unchanged). `PVCRequests` covers a single template
+and two templates, asserting the storage requests are summed and mapped onto
+`requests.storage`.
 
 Add one case that the old suite lacked, covering the init-container rule:
 
@@ -1511,10 +1522,8 @@ covers that.
 ```bash
 git add internal/sizing/deficit.go internal/sizing/deficit_test.go \
         internal/controller/resourcequota_utils.go \
-        internal/controller/resourcequota_controller.go \
-        internal/controller/event_parser_test.go \
-        internal/controller/utils_test.go
-git rm internal/controller/limits_test.go
+        internal/controller/resourcequota_controller.go
+git rm internal/controller/limits_test.go internal/controller/event_parser_test.go
 git commit -m "refactor(sizing): move pure deficit helpers out of the controller
 
 Event message parsing, workload keys and pod/PVC request aggregation carry no
@@ -3081,6 +3090,11 @@ From `internal/controller/resourcequota_utils.go` remove `ResizerConfig`,
 The only remaining functions there are `mapEventToQuota`,
 `calculateWorkloadDeficit` and `isObjectAlive`.
 
+Delete `internal/controller/utils_test.go` in the same step: it contains only
+`TestConvertToReadableFormat`, and leaving it would fail to compile. Its
+subject matter is already covered by `TestQuantize` in `internal/sizing`,
+including the object-count cases the old function got wrong.
+
 Update the tests that referenced the removed helpers: in
 `smart_calculation_test.go` and the three `event_analysis_*_test.go` files,
 replace `parseConfig(...)` with `sizing.ParsePolicy(annotations,
@@ -3119,6 +3133,7 @@ migration keeps existing installations on their current numbers.
 
 ```bash
 make lint
+git rm internal/controller/utils_test.go
 git add internal/controller cmd/main.go
 git commit -m "refactor(controller): drive resizing from the sizing package
 
