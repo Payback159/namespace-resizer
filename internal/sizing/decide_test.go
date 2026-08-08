@@ -260,3 +260,33 @@ func TestDecide_ZeroHardIsSkipped(t *testing.T) {
 		t.Fatalf("direction = %v, want none when hard is zero", got.Direction)
 	}
 }
+
+func TestDecide_MissingUsedEntryIsSkipped(t *testing.T) {
+	// A Hard key with no corresponding Used entry must not be treated as
+	// fully idle (usedMilli = 0) — that would turn it into a bogus shrink
+	// candidate aiming at the configured minimum or zero. Kubernetes always
+	// populates Used for every Hard key in practice; this guards the case
+	// where it doesn't.
+	policy := DefaultPolicy()
+	in := Input{
+		Now: testNow,
+		Hard: corev1.ResourceList{
+			corev1.ResourceRequestsCPU: resource.MustParse("16"),
+		},
+		Used:   corev1.ResourceList{},
+		Window: fillWindow(testNow, policy.WindowDays, "4"),
+		Policy: policy,
+	}
+
+	got := Decide(in)
+
+	if got.Direction != DirectionNone {
+		t.Fatalf("direction = %v, want none when Used has no entry for the key", got.Direction)
+	}
+	if len(got.Targets) != 0 {
+		t.Fatalf("Targets = %v, want empty", got.Targets)
+	}
+	if len(got.BlockedBy) != 0 {
+		t.Fatalf("BlockedBy = %v, want empty — the key should be skipped, not gated", got.BlockedBy)
+	}
+}

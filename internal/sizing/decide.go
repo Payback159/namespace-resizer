@@ -96,10 +96,11 @@ func Decide(in Input) Decision {
 			continue
 		}
 
-		usedMilli := int64(0)
-		if u, ok := in.Used[res]; ok {
-			usedMilli = u.MilliValue()
+		used, ok := in.Used[res]
+		if !ok {
+			continue
 		}
+		usedMilli := used.MilliValue()
 
 		headroom := in.Policy.HeadroomFor(res)
 		targetMilli, driver := targetFor(in, res, usedMilli, headroom)

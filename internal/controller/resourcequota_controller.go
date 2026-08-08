@@ -100,9 +100,15 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	deficits, err := r.collectDeficits(ctx, quota, state.LastModified)
+	deficitScanFailed := err != nil
 	if err != nil {
 		// A failed event scan must not stop the metric-driven path; it only
 		// means a pending shortage may be reacted to one reconcile later.
+		//
+		// It is not symmetric, though: a missing deficit can only lower the
+		// target, so a failed scan could tip a quota from "no action" into
+		// "shrink". The shrink branch below therefore requires a successful
+		// scan.
 		logger.Error(err, "failed to collect event deficits")
 	}
 
@@ -133,9 +139,16 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	if decision.Direction == sizing.DirectionShrink {
 		// Shrink PRs are wired up in the shrink-PR task. Until then the
-		// decision is observable through metrics only.
-		logger.Info("Shrink recommended but not yet actionable",
-			"targets", decision.Targets)
+		// decision is observable through metrics only. deficitScanFailed is
+		// already checked here so the guard exists before the shrink branch
+		// becomes actionable.
+		if deficitScanFailed {
+			logger.Info("Shrink suppressed: the event scan failed, so the " +
+				"target may be understated")
+		} else {
+			logger.Info("Shrink recommended but not yet actionable",
+				"targets", decision.Targets)
+		}
 	}
 
 	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
@@ -218,8 +231,14 @@ func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.R
 		}
 	}
 
-	// Update PR if recommendations changed
-	if decision.Direction != sizing.DirectionNone {
+	// Update PR if recommendations changed. Only a grow decision may rewrite
+	// the PR: a shrink decision reaching this point would otherwise lower the
+	// limits on an open grow PR, which the auto-merge block above could then
+	// merge — breaking the rule that a shrink is never auto-merged, before
+	// shrink pull requests are even supposed to exist. The shrink-PR task
+	// widens this deliberately, together with the direction state that makes
+	// it safe.
+	if decision.Direction == sizing.DirectionGrow {
 		logger.Info("PR is open, updating if needed", "prID", prID)
 		if err := r.GitProvider.UpdatePR(ctx, prID, quota.Name, req.Namespace, ns.Annotations, decision.Targets); err != nil {
 			if errors.Is(err, git.ErrFileNotFound) {
