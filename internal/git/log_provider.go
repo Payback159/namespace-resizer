@@ -31,9 +31,15 @@ func (p *LogOnlyProvider) GetPRStatus(ctx context.Context, prID int) (*PRStatus,
 	}, nil
 }
 
-func (p *LogOnlyProvider) CreatePR(ctx context.Context, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error) {
-	logger := log.FromContext(ctx)
-	logger.Info("GitOps Simulation: Creating PR", "namespace", namespace, "quota", quotaName, "newLimits", newLimits)
+func (p *LogOnlyProvider) CreatePR(
+	ctx context.Context,
+	quotaName, namespace, direction string,
+	annotations map[string]string,
+	newLimits map[corev1.ResourceName]resource.Quantity,
+) (int, error) {
+	log.FromContext(ctx).Info("Would create pull request",
+		"namespace", namespace, "quota", quotaName,
+		"direction", direction, "limits", newLimits)
 
 	// Return a random PR ID
 	return rand.Intn(1000) + 1000, nil
@@ -59,14 +65,24 @@ func (p *LogOnlyProvider) MergePR(ctx context.Context, prID int, method string) 
 }
 
 // FindOpenPR always reports no existing PR for the stateless log provider.
-func (p *LogOnlyProvider) FindOpenPR(ctx context.Context, namespace, quotaName string) (int, error) {
-	return 0, nil
+func (p *LogOnlyProvider) FindOpenPR(
+	ctx context.Context,
+	namespace, quotaName string,
+) (int, string, error) {
+	return 0, "", nil
+}
+
+func (p *LogOnlyProvider) ClosePR(ctx context.Context, prID int, comment string) error {
+	log.FromContext(ctx).Info("Would close pull request",
+		"prID", prID, "comment", comment)
+	return nil
 }
 
 // StatefulLogProvider allows simulating state changes for the demo
 type PRDetails struct {
 	Namespace string
 	QuotaName string
+	Direction string
 	NewLimits map[corev1.ResourceName]resource.Quantity
 	Status    *PRStatus
 }
@@ -107,15 +123,21 @@ func (p *StatefulLogProvider) GetPRStatus(ctx context.Context, prID int) (*PRSta
 	}, nil
 }
 
-func (p *StatefulLogProvider) CreatePR(ctx context.Context, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error) {
+func (p *StatefulLogProvider) CreatePR(
+	ctx context.Context,
+	quotaName, namespace, direction string,
+	annotations map[string]string,
+	newLimits map[corev1.ResourceName]resource.Quantity,
+) (int, error) {
 	logger := log.FromContext(ctx)
 	id := rand.Intn(1000) + 1000
-	logger.Info("GitOps Simulation: Creating PR", "namespace", namespace, "quota", quotaName, "prID", id)
+	logger.Info("GitOps Simulation: Creating PR", "namespace", namespace, "quota", quotaName, "direction", direction, "prID", id)
 
 	p.mu.Lock()
 	p.prs[id] = &PRDetails{
 		Namespace: namespace,
 		QuotaName: quotaName,
+		Direction: direction,
 		NewLimits: newLimits,
 		Status: &PRStatus{
 			IsOpen:         true,
@@ -135,19 +157,23 @@ func (p *StatefulLogProvider) UpdatePR(ctx context.Context, prID int, quotaName,
 	return nil
 }
 
-// FindOpenPR returns the number of a stored, still-open PR matching the given
-// namespace/quota, or 0 if none exists. This mirrors the GitHub provider so the
-// orphaned-PR recovery path can be exercised in dry-run/simulation mode.
-func (p *StatefulLogProvider) FindOpenPR(ctx context.Context, namespace, quotaName string) (int, error) {
+// FindOpenPR returns the number and direction of a stored, still-open PR
+// matching the given namespace/quota, or 0 and an empty direction if none
+// exists. This mirrors the GitHub provider so the orphaned-PR recovery path
+// can be exercised in dry-run/simulation mode.
+func (p *StatefulLogProvider) FindOpenPR(
+	ctx context.Context,
+	namespace, quotaName string,
+) (int, string, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for id, details := range p.prs {
 		if details.Namespace == namespace && details.QuotaName == quotaName &&
 			details.Status != nil && details.Status.IsOpen {
-			return id, nil
+			return id, details.Direction, nil
 		}
 	}
-	return 0, nil
+	return 0, "", nil
 }
 
 func (p *StatefulLogProvider) MergePR(ctx context.Context, prID int, method string) error {
@@ -174,6 +200,27 @@ func (p *StatefulLogProvider) MergePR(ctx context.Context, prID int, method stri
 		)
 	} else {
 		logger.Info("StatefulLogProvider: PR not found for merge", "prID", prID)
+	}
+	return nil
+}
+
+// ClosePR marks the stored PR as closed (without merging) and logs the
+// comment, mirroring MergePR's bookkeeping.
+func (p *StatefulLogProvider) ClosePR(ctx context.Context, prID int, comment string) error {
+	logger := log.FromContext(ctx)
+	logger.Info("GitOps Simulation: Closing PR", "prID", prID, "comment", comment)
+
+	p.mu.Lock()
+	details, ok := p.prs[prID]
+	if ok {
+		details.Status.IsOpen = false
+	}
+	p.mu.Unlock()
+
+	if ok {
+		logger.Info("StatefulLogProvider: Closed PR", "prID", prID, "newStatus", details.Status)
+	} else {
+		logger.Info("StatefulLogProvider: PR not found for close", "prID", prID)
 	}
 	return nil
 }

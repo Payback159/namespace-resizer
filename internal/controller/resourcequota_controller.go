@@ -274,14 +274,18 @@ func (r *ResourceQuotaReconciler) handleNewProposal(
 	// or a controller restart between CreatePR and AcquireLock). That leaves an
 	// open PR with no lock recorded. Without this check the controller would open
 	// a brand-new duplicate PR on every reconcile.
-	existingPRID, err := r.GitProvider.FindOpenPR(ctx, req.Namespace, quota.Name)
+	existingPRID, existingDirection, err := r.GitProvider.FindOpenPR(ctx, req.Namespace, quota.Name)
 	if err != nil {
 		logger.Error(err, "failed to check for existing open PR")
 		return ctrl.Result{}, err
 	}
 	if existingPRID != 0 {
-		logger.Info("Found existing open PR without lock; adopting it instead of creating a duplicate", "prID", existingPRID)
-		if err := r.Locker.AcquireLock(ctx, req.Namespace, quota.Name, existingPRID); err != nil {
+		logger.Info("Found existing open PR without lock; adopting it instead of creating a duplicate", "prID", existingPRID, "direction", existingDirection)
+		err = r.Locker.MutateState(ctx, req.Namespace, quota.Name, func(s *lock.State) {
+			s.PRID = existingPRID
+			s.PRDirection = existingDirection
+		})
+		if err != nil {
 			logger.Error(err, "failed to acquire lock for existing PR")
 			return ctrl.Result{}, err
 		}
@@ -330,7 +334,9 @@ func (r *ResourceQuotaReconciler) handleNewProposal(
 	}
 
 	logger.Info("No lock found, creating PR")
-	newPRID, err := r.GitProvider.CreatePR(ctx, quota.Name, req.Namespace, ns.Annotations, recommendations)
+	newPRID, err := r.GitProvider.CreatePR(
+		ctx, quota.Name, req.Namespace, decision.Direction.String(),
+		ns.Annotations, recommendations)
 	if err != nil {
 		if errors.Is(err, git.ErrFileNotFound) {
 			logger.Info("Quota file not found in Git repository. Retrying later.", "error", err.Error())

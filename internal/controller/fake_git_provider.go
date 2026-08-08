@@ -17,28 +17,40 @@ type FakeGitProvider struct {
 	// ExistingPR, when non-zero, is returned by FindOpenPR to simulate an
 	// orphaned PR that was created but never locked.
 	ExistingPR int
+	// ExistingPRDirection is returned alongside ExistingPR by FindOpenPR.
+	ExistingPRDirection string
 
 	// Call counters for assertions.
 	CreatePRCalls   int
 	UpdatePRCalls   int
 	FindOpenPRCalls int
+	// ClosePRCalls counts ClosePR invocations.
+	ClosePRCalls int
 
 	// LastLimits records the limits passed to the most recent CreatePR or
 	// UpdatePR call.
 	LastLimits map[corev1.ResourceName]resource.Quantity
 	// LastDirection records the direction passed to the most recent CreatePR.
 	LastDirection string
+
+	// ClosedPRID and ClosedComment record the most recent ClosePR call.
+	ClosedPRID    int
+	ClosedComment string
 }
 
 func (f *FakeGitProvider) GetPRStatus(ctx context.Context, prID int) (*git.PRStatus, error) {
 	return f.PRStatus, nil
 }
 
-func (f *FakeGitProvider) CreatePR(ctx context.Context, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error) {
+func (f *FakeGitProvider) CreatePR(
+	ctx context.Context,
+	quotaName, namespace, direction string,
+	annotations map[string]string,
+	newLimits map[corev1.ResourceName]resource.Quantity,
+) (int, error) {
 	f.CreatePRCalls++
 	f.LastLimits = newLimits
-	// Direction becomes a real parameter in the shrink-PR task.
-	f.LastDirection = "grow"
+	f.LastDirection = direction
 	if f.CreatePRID != 0 {
 		return f.CreatePRID, nil
 	}
@@ -56,7 +68,21 @@ func (f *FakeGitProvider) MergePR(ctx context.Context, prID int, method string) 
 	return nil
 }
 
-func (f *FakeGitProvider) FindOpenPR(ctx context.Context, namespace, quotaName string) (int, error) {
+func (f *FakeGitProvider) FindOpenPR(
+	ctx context.Context,
+	namespace, quotaName string,
+) (int, string, error) {
 	f.FindOpenPRCalls++
-	return f.ExistingPR, nil
+	direction := f.ExistingPRDirection
+	if f.ExistingPR != 0 && direction == "" {
+		direction = git.DirectionGrow
+	}
+	return f.ExistingPR, direction, nil
+}
+
+func (f *FakeGitProvider) ClosePR(ctx context.Context, prID int, comment string) error {
+	f.ClosePRCalls++
+	f.ClosedPRID = prID
+	f.ClosedComment = comment
+	return nil
 }

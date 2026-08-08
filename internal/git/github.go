@@ -29,15 +29,31 @@ const (
 	ChecksStateSuccess = "success"
 )
 
+// Pull request directions. They are persisted as a GitHub label so an
+// orphaned PR can be classified without any local state.
+const (
+	DirectionGrow   = "grow"
+	DirectionShrink = "shrink"
+
+	labelManaged         = "resizer/managed"
+	labelDirectionPrefix = "resizer/direction:"
+)
+
 type Provider interface {
 	GetPRStatus(ctx context.Context, prID int) (*PRStatus, error)
 	MergePR(ctx context.Context, prID int, method string) error
-	CreatePR(ctx context.Context, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error)
-	UpdatePR(ctx context.Context, prID int, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) error
-	// FindOpenPR returns the number of an existing open PR managed by the resizer
-	// for the given namespace/quota, or 0 if none exists. It is used to recover
-	// from orphaned PRs (created but never locked) and avoid opening duplicates.
-	FindOpenPR(ctx context.Context, namespace, quotaName string) (int, error)
+	CreatePR(ctx context.Context, quotaName, namespace, direction string,
+		annotations map[string]string,
+		newLimits map[corev1.ResourceName]resource.Quantity) (int, error)
+	UpdatePR(ctx context.Context, prID int, quotaName, namespace string,
+		annotations map[string]string,
+		newLimits map[corev1.ResourceName]resource.Quantity) error
+	// FindOpenPR returns the number and the direction of an existing open PR
+	// managed by the resizer, or 0 and an empty direction if none exists.
+	FindOpenPR(ctx context.Context, namespace, quotaName string) (int, string, error)
+	// ClosePR posts comment on the pull request and then closes it without
+	// merging.
+	ClosePR(ctx context.Context, prID int, comment string) error
 }
 
 type PRStatus struct {
@@ -158,7 +174,7 @@ func (g *GitHubProvider) MergePR(ctx context.Context, prID int, method string) e
 	return err
 }
 
-func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error) {
+func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace, direction string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error) {
 	// 1. Get default branch ref
 	repo, _, err := g.client.Repositories.Get(ctx, g.owner, g.repo)
 	if err != nil {
@@ -213,8 +229,12 @@ func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace stri
 	}
 
 	// 6. Create PR
+	title := fmt.Sprintf("Resize Quota %s in %s", quotaName, namespace)
+	if direction == DirectionShrink {
+		title = fmt.Sprintf("Shrink Quota %s in %s", quotaName, namespace)
+	}
 	newPR := &github.NewPullRequest{
-		Title:               github.Ptr(fmt.Sprintf("Resize Quota %s in %s", quotaName, namespace)),
+		Title:               github.Ptr(title),
 		Head:                github.Ptr(branchName),
 		Base:                github.Ptr(repo.GetDefaultBranch()),
 		Body:                github.Ptr(generatePRBody(namespace, quotaName, newLimits)),
@@ -227,10 +247,16 @@ func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace stri
 	}
 
 	// 7. Add Labels
-	_, _, err = g.client.Issues.AddLabelsToIssue(ctx, g.owner, g.repo, pr.GetNumber(), []string{"resizer/managed", fmt.Sprintf("resizer/ns:%s", namespace)})
+	labels := []string{
+		labelManaged,
+		fmt.Sprintf("resizer/ns:%s", namespace),
+		labelDirectionPrefix + direction,
+	}
+	_, _, err = g.client.Issues.AddLabelsToIssue(ctx, g.owner, g.repo, pr.GetNumber(), labels)
 	if err != nil {
-		// Log error but don't fail the whole flow
-		fmt.Printf("Failed to add labels: %v\n", err)
+		// A missing label is not worth failing the whole flow, but it does
+		// degrade orphan recovery, so log it at error level.
+		fmt.Printf("Failed to add labels to PR %d: %v\n", pr.GetNumber(), err)
 	}
 
 	return pr.GetNumber(), nil
@@ -296,10 +322,11 @@ func (g *GitHubProvider) UpdatePR(ctx context.Context, prID int, quotaName, name
 	return nil
 }
 
-// FindOpenPR lists open pull requests and returns the number of the one whose
-// head branch matches the deterministic resizer branch prefix for the given
-// namespace/quota. Returns 0 if no matching open PR exists.
-func (g *GitHubProvider) FindOpenPR(ctx context.Context, namespace, quotaName string) (int, error) {
+// FindOpenPR lists open pull requests and returns the number and direction of
+// the one whose head branch matches the deterministic resizer branch prefix
+// for the given namespace/quota. Returns 0 and an empty direction if no
+// matching open PR exists.
+func (g *GitHubProvider) FindOpenPR(ctx context.Context, namespace, quotaName string) (int, string, error) {
 	prefix := fmt.Sprintf("resize/%s-%s-", namespace, quotaName)
 	opts := &github.PullRequestListOptions{
 		State:       "open",
@@ -309,19 +336,53 @@ func (g *GitHubProvider) FindOpenPR(ctx context.Context, namespace, quotaName st
 	for {
 		prs, resp, err := g.client.PullRequests.List(ctx, g.owner, g.repo, opts)
 		if err != nil {
-			return 0, fmt.Errorf("failed to list pull requests: %w", err)
+			return 0, "", fmt.Errorf("failed to list pull requests: %w", err)
 		}
 		for _, pr := range prs {
-			if pr.Head != nil && strings.HasPrefix(pr.Head.GetRef(), prefix) {
-				return pr.GetNumber(), nil
+			if pr.Head == nil || !strings.HasPrefix(pr.Head.GetRef(), prefix) {
+				continue
 			}
+			return pr.GetNumber(), directionFromLabels(pr.Labels), nil
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		opts.Page = resp.NextPage
 	}
-	return 0, nil
+	return 0, "", nil
+}
+
+// directionFromLabels reads the direction label. Pull requests created before
+// the label existed carry none; treating them as grow preserves the previous
+// behaviour and never enables an unreviewed shrink merge.
+func directionFromLabels(labels []*github.Label) string {
+	for _, label := range labels {
+		name := label.GetName()
+		if strings.HasPrefix(name, labelDirectionPrefix) {
+			if value := strings.TrimPrefix(name, labelDirectionPrefix); value != "" {
+				return value
+			}
+		}
+	}
+	return DirectionGrow
+}
+
+// ClosePR records why the pull request is being abandoned and then closes it.
+// The comment is posted first: if closing fails the reason is still visible,
+// whereas a closed PR with no explanation is confusing for reviewers.
+func (g *GitHubProvider) ClosePR(ctx context.Context, prID int, comment string) error {
+	body := &github.IssueComment{Body: github.Ptr(comment)}
+	if _, _, err := g.client.Issues.CreateComment(
+		ctx, g.owner, g.repo, prID, body); err != nil {
+		return fmt.Errorf("failed to comment on PR %d: %w", prID, err)
+	}
+
+	update := &github.PullRequest{State: github.Ptr("closed")}
+	if _, _, err := g.client.PullRequests.Edit(
+		ctx, g.owner, g.repo, prID, update); err != nil {
+		return fmt.Errorf("failed to close PR %d: %w", prID, err)
+	}
+	return nil
 }
 
 func (g *GitHubProvider) findQuotaFile(ctx context.Context, basePath, ref, quotaName string) (string, *github.RepositoryContent, error) {

@@ -300,7 +300,7 @@ func TestCreatePR(t *testing.T) {
 		corev1.ResourceRequestsCPU: resource.MustParse("2"),
 	}
 
-	prID, err := provider.CreatePR(context.TODO(), "my-quota", "default", nil, limits)
+	prID, err := provider.CreatePR(context.TODO(), "my-quota", "default", DirectionGrow, nil, limits)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(prID).To(Equal(101))
 }
