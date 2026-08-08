@@ -80,3 +80,16 @@ metadata:
     resizer.io/cooldown-minutes: "30"   # Nur 30min Pause
     resizer.io/auto-merge: "true"       # (Optional) Automatisch mergen
 ```
+
+## 7. Monitoring und Metriken
+
+### Prometheus-Metriken
+
+Der Controller exposiert Prometheus-Metriken auf dem Standard-Port `:8443`. Für die Beobachtung des Shrink-Pfads (insbesondere im Flag-Off-Rollout) sind diese Metriken **essentiell**:
+
+*   **`resizer_quota_target`**: Das berechnete Ziel für jede Quota-Ressource (in Milli-Einheiten)
+*   **`resizer_quota_waste_ratio`**: Verhältnis von aktueller Hard-Limit zu berechnetem Ziel
+*   **`resizer_shrink_blocked_by`**: Gate, das eine Shrink-Operation derzeit blockiert (1 = blockiert, 0 = nicht blockiert)
+*   **`resizer_decision_total`**: Anzahl der Sizing-Decisions pro Richtung (grow/shrink/none)
+
+**Wichtig:** Für das Dry-Run-Rollout des Shrink-Pfads (bevor echte Shrink-PRs möglich sind) müssen die Metriken aktiviert sein. Das `--metrics-bind-address` Flag in `config/manager/manager.yaml` muss auf `:8443` (oder einen anderen Port) gesetzt werden, damit die Metriken sichtbar sind. Ohne diese Metriken ist der Dry-Run "blind" und kann keine informierte Entscheidung treffen.

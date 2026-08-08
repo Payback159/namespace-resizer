@@ -123,7 +123,7 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		LastShrink: state.LastShrink,
 	})
 
-	// The metrics task adds a recordDecision call right here.
+	recordDecision(req.Namespace, quota.Name, quota.Status.Hard, decision)
 	logger.V(1).Info("Sizing decision",
 		"direction", decision.Direction.String(),
 		"targets", decision.Targets,
