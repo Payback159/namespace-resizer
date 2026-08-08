@@ -3,10 +3,12 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 	"github.com/payback159/namespace-resizer/internal/git"
 	"github.com/payback159/namespace-resizer/internal/lock"
+	"github.com/payback159/namespace-resizer/internal/sizing"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -23,8 +25,9 @@ const (
 	prTestQuota = "test-quota"
 )
 
-// newResizeNeededQuota builds a ResourceQuota that is over the default 80%
-// threshold (used 9 of hard 10 CPU) so the reconciler produces a recommendation.
+// newResizeNeededQuota builds a ResourceQuota that is fully used (used == hard
+// CPU) so that, under sizing.DefaultPolicy, the target (used * 1.25 headroom)
+// clears the tolerance band and the reconciler proposes a grow.
 func newResizeNeededQuota() *corev1.ResourceQuota {
 	return &corev1.ResourceQuota{
 		ObjectMeta: metav1.ObjectMeta{
@@ -41,7 +44,7 @@ func newResizeNeededQuota() *corev1.ResourceQuota {
 				corev1.ResourceRequestsCPU: resource.MustParse("10"),
 			},
 			Used: corev1.ResourceList{
-				corev1.ResourceRequestsCPU: resource.MustParse("9"),
+				corev1.ResourceRequestsCPU: resource.MustParse("10"),
 			},
 		},
 	}
@@ -63,10 +66,12 @@ func newPRTestReconciler(t *testing.T) (*ResourceQuotaReconciler, *fakeClientBun
 
 	locker := lock.NewLeaseLocker(fakeClient)
 	r := &ResourceQuotaReconciler{
-		Client:   fakeClient,
-		Scheme:   scheme,
-		Recorder: record.NewFakeRecorder(100),
-		Locker:   locker,
+		Client:     fakeClient,
+		Scheme:     scheme,
+		Recorder:   record.NewFakeRecorder(100),
+		Locker:     locker,
+		Observer:   NewObserver(locker, time.Now),
+		BasePolicy: sizing.DefaultPolicy(),
 	}
 	return r, &fakeClientBundle{locker: locker}
 }
@@ -147,6 +152,8 @@ func TestHandleActivePR_MergeReleasesLock(t *testing.T) {
 		Recorder:        record.NewFakeRecorder(100),
 		GitProvider:     fakeGit,
 		Locker:          locker,
+		Observer:        NewObserver(locker, time.Now),
+		BasePolicy:      sizing.DefaultPolicy(),
 		EnableAutoMerge: true,
 	}
 

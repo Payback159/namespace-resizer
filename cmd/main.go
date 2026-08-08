@@ -40,6 +40,7 @@ import (
 	"github.com/payback159/namespace-resizer/internal/controller"
 	"github.com/payback159/namespace-resizer/internal/git"
 	"github.com/payback159/namespace-resizer/internal/lock"
+	"github.com/payback159/namespace-resizer/internal/sizing"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -265,6 +266,13 @@ func main() {
 
 	locker := lock.NewLeaseLocker(mgr.GetClient())
 
+	basePolicy := sizing.DefaultPolicy()
+	// Shrinking stays off until the rollout flag lands; the decision is still
+	// computed so the dry-run metrics show what would happen.
+	basePolicy.ShrinkEnabled = false
+
+	observer := controller.NewObserver(locker, time.Now)
+
 	// Start Lease Garbage Collector (runs every 12 hours)
 	gc := lock.NewLeaseGarbageCollector(mgr.GetClient(), 12*time.Hour)
 	if err := mgr.Add(gc); err != nil {
@@ -280,6 +288,8 @@ func main() {
 		Recorder:        mgr.GetEventRecorderFor("namespace-resizer"), //nolint:staticcheck // legacy events API
 		GitProvider:     gitProvider,
 		Locker:          locker,
+		Observer:        observer,
+		BasePolicy:      basePolicy,
 		EnableAutoMerge: enableAutoMerge,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ResourceQuota")

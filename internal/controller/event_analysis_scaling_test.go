@@ -16,7 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-func TestAnalyzeEvents_StatefulSet_MassiveScaling(t *testing.T) {
+func TestCollectDeficits_StatefulSet_MassiveScaling(t *testing.T) {
 	g := NewWithT(t)
 
 	// Setup Scheme
@@ -123,28 +123,18 @@ func TestAnalyzeEvents_StatefulSet_MassiveScaling(t *testing.T) {
 	}
 
 	// 5. Run Analysis
-	config := ResizerConfig{
-		Thresholds:       map[corev1.ResourceName]float64{corev1.ResourceCPU: 80},
-		IncrementFactors: map[corev1.ResourceName]float64{corev1.ResourceCPU: 0.0}, // 0 buffer for exact calculation check
-		Cooldown:         time.Minute,
-	}
-
-	recs, err := r.analyzeEvents(context.TODO(), quota, config)
+	deficits, err := r.collectDeficits(context.TODO(), quota, time.Time{})
 	g.Expect(err).ToNot(HaveOccurred())
 
 	// 6. Verify
-	// Used: 10
-	// Deficit: 3 (1 per pod)
-	// Total Needed: 13
-	// Buffer: 0
-	// Recommendation: 13
-
-	g.Expect(recs).To(HaveKey(corev1.ResourceCPU))
-	val := recs[corev1.ResourceCPU]
-	g.Expect(val.String()).To(Equal("13"))
+	// 3 missing replicas, 1 CPU each. All 3 events are retries of the same
+	// workload ("web"), so the deficit is the MAX seen for that workload, not
+	// the sum: 3 missing * 1 CPU = 3 CPU raw deficit.
+	g.Expect(deficits).To(HaveKey(corev1.ResourceCPU))
+	g.Expect(deficits[corev1.ResourceCPU]).To(Equal(int64(3000)))
 }
 
-func TestAnalyzeEvents_ReplicaSet_MassiveScaling(t *testing.T) {
+func TestCollectDeficits_ReplicaSet_MassiveScaling(t *testing.T) {
 	g := NewWithT(t)
 
 	// Setup Scheme
@@ -229,23 +219,11 @@ func TestAnalyzeEvents_ReplicaSet_MassiveScaling(t *testing.T) {
 	}
 
 	// 5. Run Analysis
-	config := ResizerConfig{
-		Thresholds:       map[corev1.ResourceName]float64{corev1.ResourceCPU: 80},
-		IncrementFactors: map[corev1.ResourceName]float64{corev1.ResourceCPU: 0.0}, // 0 buffer
-		Cooldown:         time.Minute,
-	}
-
-	recs, err := r.analyzeEvents(context.TODO(), quota, config)
+	deficits, err := r.collectDeficits(context.TODO(), quota, time.Time{})
 	g.Expect(err).ToNot(HaveOccurred())
 
 	// 6. Verify
-	// Used: 10
-	// Deficit: 10 (1 * 10 missing pods)
-	// Total Needed: 20
-	// Buffer: 0
-	// Recommendation: 20
-
-	g.Expect(recs).To(HaveKey(corev1.ResourceCPU))
-	val := recs[corev1.ResourceCPU]
-	g.Expect(val.String()).To(Equal("20"))
+	// 10 missing replicas * 1 CPU = 10 CPU raw deficit.
+	g.Expect(deficits).To(HaveKey(corev1.ResourceCPU))
+	g.Expect(deficits[corev1.ResourceCPU]).To(Equal(int64(10000)))
 }

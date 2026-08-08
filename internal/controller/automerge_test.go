@@ -3,11 +3,13 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 	"github.com/payback159/namespace-resizer/internal/config"
 	"github.com/payback159/namespace-resizer/internal/git"
 	"github.com/payback159/namespace-resizer/internal/lock"
+	"github.com/payback159/namespace-resizer/internal/sizing"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -80,6 +82,8 @@ func TestAutoMerge(t *testing.T) {
 			Scheme:          scheme,
 			GitProvider:     fakeGit,
 			Locker:          locker,
+			Observer:        NewObserver(locker, time.Now),
+			BasePolicy:      sizing.DefaultPolicy(),
 			EnableAutoMerge: enableGlobal,
 		}
 

@@ -22,6 +22,12 @@ type FakeGitProvider struct {
 	CreatePRCalls   int
 	UpdatePRCalls   int
 	FindOpenPRCalls int
+
+	// LastLimits records the limits passed to the most recent CreatePR or
+	// UpdatePR call.
+	LastLimits map[corev1.ResourceName]resource.Quantity
+	// LastDirection records the direction passed to the most recent CreatePR.
+	LastDirection string
 }
 
 func (f *FakeGitProvider) GetPRStatus(ctx context.Context, prID int) (*git.PRStatus, error) {
@@ -30,6 +36,9 @@ func (f *FakeGitProvider) GetPRStatus(ctx context.Context, prID int) (*git.PRSta
 
 func (f *FakeGitProvider) CreatePR(ctx context.Context, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error) {
 	f.CreatePRCalls++
+	f.LastLimits = newLimits
+	// Direction becomes a real parameter in the shrink-PR task.
+	f.LastDirection = "grow"
 	if f.CreatePRID != 0 {
 		return f.CreatePRID, nil
 	}
@@ -38,6 +47,7 @@ func (f *FakeGitProvider) CreatePR(ctx context.Context, quotaName, namespace str
 
 func (f *FakeGitProvider) UpdatePR(ctx context.Context, prID int, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) error {
 	f.UpdatePRCalls++
+	f.LastLimits = newLimits
 	return nil
 }
 

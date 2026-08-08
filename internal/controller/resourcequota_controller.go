@@ -24,7 +24,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
@@ -46,6 +45,8 @@ type ResourceQuotaReconciler struct {
 	Recorder        record.EventRecorder
 	GitProvider     git.Provider
 	Locker          *lock.LeaseLocker
+	Observer        *Observer
+	BasePolicy      sizing.Policy
 	EnableAutoMerge bool
 }
 
@@ -77,100 +78,73 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// 3. Check Opt-Out
-	if val, ok := ns.Annotations["resizer.io/enabled"]; ok && val == "false" {
+	policy, warnings := sizing.ParsePolicy(ns.Annotations, r.BasePolicy)
+	for _, warning := range warnings {
+		logger.V(1).Info("deprecated annotation in use", "detail", warning)
+	}
+	if !policy.Enabled {
 		logger.V(1).Info("Namespace is opted out", "namespace", req.Namespace)
 		return ctrl.Result{}, nil
 	}
 
-	// 4. Parse Configuration (Defaults + Overrides)
-	config := parseConfig(ns.Annotations)
-
-	// 5. Calculate Recommendations (Metrics + Events)
-	recommendations, needsResize, err := r.calculateRecommendations(ctx, quota, config)
+	window, err := r.Observer.Observe(ctx, &quota, policy.WindowDays)
 	if err != nil {
-		logger.Error(err, "failed to calculate recommendations")
-		// Continue execution, maybe metrics worked but events failed?
-		// For now, we proceed if we have any recommendations.
-	}
-
-	// 6. GitOps Workflow
-	// Check Lock first (regardless of whether we need a resize now)
-	prID, err := r.Locker.GetLock(ctx, req.Namespace, quota.Name)
-	if err != nil {
-		logger.Error(err, "failed to get lock")
+		logger.Error(err, "failed to record observation")
 		return ctrl.Result{}, err
 	}
 
-	if prID != 0 {
-		// Case A: Lock exists -> Handle Active PR
-		return r.handleActivePR(ctx, req, quota, ns, prID, recommendations, needsResize)
+	state, err := r.Locker.GetState(ctx, req.Namespace, quota.Name)
+	if err != nil {
+		logger.Error(err, "failed to read lease state")
+		return ctrl.Result{}, err
 	}
 
-	if needsResize {
-		// Case B: No Lock AND Needs Resize -> Handle New Proposal
-		return r.handleNewProposal(ctx, req, quota, ns, config, recommendations)
+	deficits, err := r.collectDeficits(ctx, quota, state.LastModified)
+	if err != nil {
+		// A failed event scan must not stop the metric-driven path; it only
+		// means a pending shortage may be reacted to one reconcile later.
+		logger.Error(err, "failed to collect event deficits")
 	}
 
-	// Case C: No Lock, No Resize needed -> Idle
+	decision := sizing.Decide(sizing.Input{
+		Now:        time.Now(),
+		Hard:       quota.Status.Hard,
+		Used:       quota.Status.Used,
+		Deficits:   deficits,
+		Window:     window,
+		Policy:     policy,
+		LastGrow:   state.LastGrow,
+		LastShrink: state.LastShrink,
+	})
+
+	// The metrics task adds a recordDecision call right here.
+	logger.V(1).Info("Sizing decision",
+		"direction", decision.Direction.String(),
+		"targets", decision.Targets,
+		"blockedBy", decision.BlockedBy)
+
+	if state.PRID != 0 {
+		return r.handleActivePR(ctx, req, quota, ns, state, decision)
+	}
+
+	if decision.Direction == sizing.DirectionGrow {
+		return r.handleNewProposal(ctx, req, quota, ns, policy, state, decision)
+	}
+
+	if decision.Direction == sizing.DirectionShrink {
+		// Shrink PRs are wired up in the shrink-PR task. Until then the
+		// decision is observable through metrics only.
+		logger.Info("Shrink recommended but not yet actionable",
+			"targets", decision.Targets)
+	}
+
 	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 }
 
-// calculateRecommendations combines metric-based and event-based analysis
-func (r *ResourceQuotaReconciler) calculateRecommendations(ctx context.Context, quota corev1.ResourceQuota, config ResizerConfig) (map[corev1.ResourceName]resource.Quantity, bool, error) {
-	logger := log.FromContext(ctx)
-	recommendations := make(map[corev1.ResourceName]resource.Quantity)
-	needsResize := false
-
-	// A. Metric Analysis
-	for resName, hardLimit := range quota.Status.Hard {
-		used, ok := quota.Status.Used[resName]
-		if !ok {
-			continue
-		}
-
-		limitVal := hardLimit.MilliValue()
-		usedVal := used.MilliValue()
-
-		if limitVal == 0 {
-			continue
-		}
-
-		percentage := (float64(usedVal) / float64(limitVal)) * 100
-
-		if percentage >= config.GetThreshold(resName) {
-			logger.Info("Threshold exceeded", "resource", resName, "usage", percentage, "threshold", config.GetThreshold(resName))
-
-			increment := float64(limitVal) * config.GetIncrement(resName)
-			newLimitVal := int64(float64(limitVal) + increment)
-			newLimit := convertToReadableFormat(resName, newLimitVal, hardLimit.Format)
-
-			recommendations[resName] = newLimit
-			needsResize = true
-		}
-	}
-
-	// B. Event Analysis
-	eventRecommendations, err := r.analyzeEvents(ctx, quota, config)
-	if err != nil {
-		return recommendations, needsResize, err
-	}
-
-	for res, recLimit := range eventRecommendations {
-		// If event recommendation is higher than metric recommendation, use it
-		if existing, ok := recommendations[res]; !ok || recLimit.Cmp(existing) > 0 {
-			recommendations[res] = recLimit
-			needsResize = true
-			logger.Info("Event-based recommendation triggered", "resource", res, "newLimit", recLimit.String())
-		}
-	}
-
-	return recommendations, needsResize, nil
-}
-
 // handleActivePR manages the lifecycle of an existing Pull Request
-func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.Request, quota corev1.ResourceQuota, ns corev1.Namespace, prID int, recommendations map[corev1.ResourceName]resource.Quantity, needsResize bool) (ctrl.Result, error) {
+func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.Request, quota corev1.ResourceQuota, ns corev1.Namespace, state lock.State, decision sizing.Decision) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	prID := state.PRID
 	logger.Info("Lock found, checking PR status", "prID", prID)
 
 	status, err := r.GitProvider.GetPRStatus(ctx, prID)
@@ -245,9 +219,9 @@ func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.R
 	}
 
 	// Update PR if recommendations changed
-	if needsResize {
+	if decision.Direction != sizing.DirectionNone {
 		logger.Info("PR is open, updating if needed", "prID", prID)
-		if err := r.GitProvider.UpdatePR(ctx, prID, quota.Name, req.Namespace, ns.Annotations, recommendations); err != nil {
+		if err := r.GitProvider.UpdatePR(ctx, prID, quota.Name, req.Namespace, ns.Annotations, decision.Targets); err != nil {
 			if errors.Is(err, git.ErrFileNotFound) {
 				logger.Info("Quota file not found in Git repository during update. Retrying later.", "error", err.Error())
 				return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
@@ -263,8 +237,17 @@ func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.R
 }
 
 // handleNewProposal manages the creation of new Pull Requests
-func (r *ResourceQuotaReconciler) handleNewProposal(ctx context.Context, req ctrl.Request, quota corev1.ResourceQuota, ns corev1.Namespace, config ResizerConfig, recommendations map[corev1.ResourceName]resource.Quantity) (ctrl.Result, error) {
+func (r *ResourceQuotaReconciler) handleNewProposal(
+	ctx context.Context,
+	req ctrl.Request,
+	quota corev1.ResourceQuota,
+	ns corev1.Namespace,
+	policy sizing.Policy,
+	state lock.State,
+	decision sizing.Decision,
+) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	recommendations := decision.Targets
 
 	// 0. Recover orphaned PRs before creating a new one.
 	// A PR may have been created in a previous reconcile where the subsequent
@@ -306,17 +289,12 @@ func (r *ResourceQuotaReconciler) handleNewProposal(ctx context.Context, req ctr
 	}
 
 	// 2. Smart Cooldown Check
-	lastMod, err := r.Locker.GetLastModified(ctx, req.Namespace, quota.Name)
-	if err != nil {
-		logger.Error(err, "failed to get last modified time")
-		return ctrl.Result{}, err
-	}
-
+	lastMod := state.LastModified
 	if !lastMod.IsZero() {
 		elapsed := time.Since(lastMod)
-		if elapsed < config.Cooldown {
-			remaining := config.Cooldown - elapsed
-			logger.Info("Skipping resize due to cooldown", "cooldown", config.Cooldown, "remaining", remaining)
+		if elapsed < policy.GrowCooldown {
+			remaining := policy.GrowCooldown - elapsed
+			logger.Info("Skipping resize due to cooldown", "cooldown", policy.GrowCooldown, "remaining", remaining)
 			// Requeue exactly when cooldown expires (plus a small buffer)
 			return ctrl.Result{RequeueAfter: remaining + 1*time.Second}, nil
 		}
@@ -344,149 +322,116 @@ func (r *ResourceQuotaReconciler) handleNewProposal(ctx context.Context, req ctr
 	}
 
 	logger.Info("PR created, acquiring lock", "prID", newPRID)
-	if err := r.Locker.AcquireLock(ctx, req.Namespace, quota.Name, newPRID); err != nil {
-		logger.Error(err, "failed to acquire lock")
+	err = r.Locker.MutateState(ctx, req.Namespace, quota.Name, func(s *lock.State) {
+		s.PRID = newPRID
+		s.PRDirection = sizing.DirectionGrow.String()
+		s.LastGrow = time.Now()
+	})
+	if err != nil {
+		logger.Error(err, "failed to record the new pull request")
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 }
 
-func (r *ResourceQuotaReconciler) analyzeEvents(ctx context.Context, quota corev1.ResourceQuota, config ResizerConfig) (map[corev1.ResourceName]resource.Quantity, error) {
+// collectDeficits scans recent FailedCreate events and returns, per quota key,
+// the additional milli-value that the blocked workloads asked for. Events older
+// than the last successful change are skipped so a single shortage cannot be
+// counted twice.
+func (r *ResourceQuotaReconciler) collectDeficits(
+	ctx context.Context,
+	quota corev1.ResourceQuota,
+	since time.Time,
+) (map[corev1.ResourceName]int64, error) {
 	logger := log.FromContext(ctx)
-	recommendations := make(map[corev1.ResourceName]resource.Quantity)
 
-	// List events in the namespace
 	var eventList corev1.EventList
 	if err := r.List(ctx, &eventList, client.InNamespace(quota.Namespace)); err != nil {
 		return nil, err
 	}
 
-	// Get LastModified to filter old events (Deduplication)
-	lastMod, err := r.Locker.GetLastModified(ctx, quota.Namespace, quota.Name)
-	if err != nil {
-		// Log error but continue, assuming no last modified (process all events)
-		// We don't have a logger here easily, but we can ignore or return error.
-		// Returning error might be safer to avoid double counting if DB is down.
-		// return nil, fmt.Errorf("failed to get last modified time: %w", err)
-		logger.Error(err, "failed to get last modified time")
-	}
+	cutoff := time.Now().Add(-1 * time.Hour)
 
-	// Look for recent FailedCreate events mentioning this quota
-	cutoff := time.Now().Add(-1 * time.Hour) // Only look at events from last hour
-
-	// Map to store max requested per resource per workload key
-	// map[ResourceName]map[WorkloadKey]int64 (milli-value)
-	deficits := make(map[corev1.ResourceName]map[string]int64)
+	// Keyed by resource, then by workload: the maximum per workload, summed
+	// across workloads. Retries of one workload must not accumulate.
+	perWorkload := make(map[corev1.ResourceName]map[string]int64)
 
 	for _, evt := range eventList.Items {
 		if evt.LastTimestamp.Time.Before(cutoff) {
 			continue
 		}
-		// Deduplication: Ignore events that happened before the last successful resize
-		if !lastMod.IsZero() && evt.LastTimestamp.Time.Before(lastMod) {
+		if !since.IsZero() && evt.LastTimestamp.Time.Before(since) {
 			continue
 		}
-
 		if evt.Type != corev1.EventTypeWarning || evt.Reason != reasonFailedCreate {
 			continue
 		}
-
-		if !strings.Contains(evt.Message, "exceeded quota") || !strings.Contains(evt.Message, quota.Name) {
+		if !strings.Contains(evt.Message, "exceeded quota") ||
+			!strings.Contains(evt.Message, quota.Name) {
 			continue
 		}
 
-		// 1. Parse Message
 		resName, reqQty, err := sizing.ParseEventMessage(evt.Message)
 		if err != nil {
 			logger.Error(err, "Failed to parse event message", "message", evt.Message)
 			continue
 		}
-
-		// 2. Liveness Check
-		// Ensure the object causing the event still exists.
-		// This prevents "ghost" deficits from deleted workloads (e.g. during rollback/restart).
 		if !r.isObjectAlive(ctx, evt.InvolvedObject, quota.Namespace) {
 			continue
 		}
 
-		// 3. Update Deficits (Grouped by Workload Prefix)
-		// We group by the "Workload Key" (e.g. ReplicaSet name) to distinguish between
-		// "Same workload retrying" (use MAX) and "Different workloads failing" (use SUM).
 		key, workloadDeficits := r.calculateWorkloadDeficit(ctx, evt, resName, reqQty)
-
-		// Iterate over all resources returned by the smart calculation
-		for rName, deficitValue := range workloadDeficits {
-			// Initialize map for this resource if needed
-			if _, ok := deficits[rName]; !ok {
-				deficits[rName] = make(map[string]int64)
+		for rName, value := range workloadDeficits {
+			if _, ok := perWorkload[rName]; !ok {
+				perWorkload[rName] = make(map[string]int64)
 			}
-
-			// Store the max requested value seen for this specific workload key
-			// Note: If smart calculation returns a value, it's the TOTAL deficit for that workload.
-			// If we see multiple events for the same workload (e.g. CPU failed, then Mem failed?),
-			// we should take the max. But usually smart calculation returns the same total.
-			if deficitValue > deficits[rName][key] {
-				deficits[rName][key] = deficitValue
+			if value > perWorkload[rName][key] {
+				perWorkload[rName][key] = value
 			}
 		}
 	}
 
-	// Now calculate recommendations based on SUM of MAX deficits per workload
-	for resName, workloadMap := range deficits {
-		var totalDeficit int64
-		for _, val := range workloadMap {
-			totalDeficit += val
+	deficits := make(map[corev1.ResourceName]int64, len(perWorkload))
+	for resName, workloads := range perWorkload {
+		var total int64
+		for _, value := range workloads {
+			total += value
 		}
-
-		// Resolve Quota Resource Name (Map cpu -> requests.cpu if needed, or vice versa)
-		quotaResName := resName
-		if _, ok := quota.Status.Hard[quotaResName]; !ok {
-			// 1. Try mapping Short -> Long (cpu -> requests.cpu)
-			switch resName {
-			case corev1.ResourceCPU:
-				quotaResName = corev1.ResourceRequestsCPU
-			case corev1.ResourceMemory:
-				quotaResName = corev1.ResourceRequestsMemory
-			case corev1.ResourceStorage:
-				quotaResName = corev1.ResourceRequestsStorage
-			}
-
-			// 2. If still not found, try mapping Long -> Short (requests.cpu -> cpu)
-			// This handles cases where Quota uses legacy "cpu" but we calculated "requests.cpu"
-			if _, ok := quota.Status.Hard[quotaResName]; !ok {
-				switch resName {
-				case corev1.ResourceRequestsCPU:
-					quotaResName = corev1.ResourceCPU
-				case corev1.ResourceRequestsMemory:
-					quotaResName = corev1.ResourceMemory
-				}
-			}
+		quotaKey, ok := resolveQuotaKey(quota, resName)
+		if !ok {
+			continue
 		}
-
-		if currentHard, ok := quota.Status.Hard[quotaResName]; ok {
-			currentUsed := quota.Status.Used[quotaResName]
-
-			// Calculate base need (Used + Total Deficit from distinct workloads)
-			baseMilli := currentUsed.MilliValue() + totalDeficit
-
-			// Calculate buffer based on the NEW total need
-			bufferMilli := float64(baseMilli) * config.GetIncrement(quotaResName)
-
-			// Total
-			totalMilli := baseMilli + int64(bufferMilli)
-
-			// Create new Quantity with correct format/rounding
-			needed := convertToReadableFormat(quotaResName, totalMilli, currentHard.Format)
-
-			// Only recommend if the new limit is actually higher than the current limit
-			if needed.Cmp(currentHard) > 0 {
-				recommendations[quotaResName] = needed
-			}
-		}
+		deficits[quotaKey] += total
 	}
 
-	return recommendations, nil
+	return deficits, nil
+}
+
+// resolveQuotaKey maps a resource name derived from an event onto the key the
+// quota actually uses, trying the short and the long form in turn.
+func resolveQuotaKey(
+	quota corev1.ResourceQuota,
+	res corev1.ResourceName,
+) (corev1.ResourceName, bool) {
+	if _, ok := quota.Status.Hard[res]; ok {
+		return res, true
+	}
+
+	candidates := map[corev1.ResourceName]corev1.ResourceName{
+		corev1.ResourceCPU:             corev1.ResourceRequestsCPU,
+		corev1.ResourceMemory:          corev1.ResourceRequestsMemory,
+		corev1.ResourceStorage:         corev1.ResourceRequestsStorage,
+		corev1.ResourceRequestsCPU:     corev1.ResourceCPU,
+		corev1.ResourceRequestsMemory:  corev1.ResourceMemory,
+		corev1.ResourceRequestsStorage: corev1.ResourceStorage,
+	}
+	if alt, ok := candidates[res]; ok {
+		if _, ok := quota.Status.Hard[alt]; ok {
+			return alt, true
+		}
+	}
+	return "", false
 }
 
 // SetupWithManager sets up the controller with the Manager.

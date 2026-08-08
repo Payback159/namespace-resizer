@@ -18,10 +18,7 @@ package controller
 
 import (
 	"context"
-	"math"
-	"strconv"
 	"strings"
-	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -36,8 +33,6 @@ import (
 	"github.com/payback159/namespace-resizer/internal/sizing"
 )
 
-const defaultKey = "default"
-
 // Kubernetes event reason and involved-object kinds handled by event analysis.
 const (
 	reasonFailedCreate = "FailedCreate"
@@ -46,157 +41,6 @@ const (
 	kindReplicaSet     = "ReplicaSet"
 	kindPod            = "Pod"
 )
-
-type ResizerConfig struct {
-	Thresholds       map[corev1.ResourceName]float64
-	IncrementFactors map[corev1.ResourceName]float64
-	Cooldown         time.Duration
-}
-
-func (c ResizerConfig) GetThreshold(res corev1.ResourceName) float64 {
-	// Check for specific resource match
-	if v, ok := c.Thresholds[res]; ok {
-		return v
-	}
-
-	// Check for resource type match (e.g. requests.cpu -> cpu)
-	switch {
-	case strings.Contains(string(res), "cpu"):
-		if v, ok := c.Thresholds[corev1.ResourceCPU]; ok {
-			return v
-		}
-	case strings.Contains(string(res), "memory"):
-		if v, ok := c.Thresholds[corev1.ResourceMemory]; ok {
-			return v
-		}
-	case strings.Contains(string(res), "storage"):
-		if v, ok := c.Thresholds[corev1.ResourceStorage]; ok {
-			return v
-		}
-	}
-
-	// Fallback to default
-	if v, ok := c.Thresholds[defaultKey]; ok {
-		return v
-	}
-	return 80.0
-}
-
-func (c ResizerConfig) GetIncrement(res corev1.ResourceName) float64 {
-	if v, ok := c.IncrementFactors[res]; ok {
-		return v
-	}
-	if strings.Contains(string(res), "cpu") {
-		if v, ok := c.IncrementFactors[corev1.ResourceCPU]; ok {
-			return v
-		}
-	}
-	if strings.Contains(string(res), "memory") {
-		if v, ok := c.IncrementFactors[corev1.ResourceMemory]; ok {
-			return v
-		}
-	}
-	if strings.Contains(string(res), "storage") {
-		if v, ok := c.IncrementFactors[corev1.ResourceStorage]; ok {
-			return v
-		}
-	}
-	if v, ok := c.IncrementFactors[defaultKey]; ok {
-		return v
-	}
-	return 0.2
-}
-
-func parseConfig(annotations map[string]string) ResizerConfig {
-	config := ResizerConfig{
-		Thresholds:       make(map[corev1.ResourceName]float64),
-		IncrementFactors: make(map[corev1.ResourceName]float64),
-		Cooldown:         60 * time.Minute,
-	}
-
-	// Set Defaults
-	config.Thresholds[defaultKey] = 80.0
-	config.IncrementFactors[defaultKey] = 0.2
-
-	// Helper to parse percentage
-	parsePercent := func(val string) (float64, bool) {
-		clean := strings.TrimSuffix(val, "%")
-		v, err := strconv.ParseFloat(clean, 64)
-		if err != nil {
-			return 0, false
-		}
-		if strings.HasSuffix(val, "%") {
-			return v / 100.0, true
-		}
-		return v, true // Assume raw float (0.2) or int (80) depending on context?
-		// For threshold we expect 80. For increment we expect 0.2 or 20%.
-		// Let's handle them separately in the loop if needed, or just be smart.
-	}
-
-	for k, v := range annotations {
-		if !strings.HasPrefix(k, "resizer.io/") {
-			continue
-		}
-		key := strings.TrimPrefix(k, "resizer.io/")
-
-		// Thresholds
-		if strings.HasSuffix(key, "-threshold") {
-			// e.g. "threshold", "cpu-threshold", "requests.memory-threshold"
-			res := strings.TrimSuffix(key, "-threshold")
-			if res == "" {
-				res = defaultKey
-			}
-
-			if val, err := strconv.ParseFloat(v, 64); err == nil {
-				config.Thresholds[corev1.ResourceName(res)] = val
-			}
-		}
-
-		// Increments
-		if strings.HasSuffix(key, "-increment") {
-			res := strings.TrimSuffix(key, "-increment")
-			if res == "" {
-				res = defaultKey
-			}
-
-			if val, ok := parsePercent(v); ok {
-				// If user wrote "20", parsePercent returns 20. But for increment we want 0.2?
-				// Or maybe we standardize on "0.2" or "20%".
-				// If > 1, assume percentage? No, 2.0 means 200%.
-				// Let's stick to: if "%" suffix -> /100. If no suffix -> raw value.
-				// But for threshold "80" means 80%.
-				// Increment: "0.2" = 20%. "20%" = 20%.
-				config.IncrementFactors[corev1.ResourceName(res)] = val
-			}
-		}
-
-		// Cooldown
-		if key == "cooldown-minutes" {
-			if val, err := strconv.Atoi(v); err == nil {
-				config.Cooldown = time.Duration(val) * time.Minute
-			}
-		}
-	}
-
-	return config
-}
-
-func convertToReadableFormat(resName corev1.ResourceName, milliValue int64, format resource.Format) resource.Quantity {
-	if strings.Contains(string(resName), "memory") || strings.Contains(string(resName), "storage") {
-		// Memory/Storage Fix: Convert from Milli-Bytes back to Bytes
-		// 1000 Millis = 1 Byte
-		bytesValue := float64(milliValue) / 1000.0
-
-		// Round up to the nearest Mebibyte (Mi) to ensure readable output (e.g. "123Mi" instead of raw bytes)
-		// Kubernetes resource.Quantity prefers multiples of 1024 for BinarySI to display friendly units.
-		const bytesPerMi = 1024 * 1024
-		miValue := math.Ceil(bytesValue / float64(bytesPerMi))
-		newBytesValue := int64(miValue * float64(bytesPerMi))
-
-		return *resource.NewQuantity(newBytesValue, resource.BinarySI)
-	}
-	return *resource.NewMilliQuantity(milliValue, format)
-}
 
 func (r *ResourceQuotaReconciler) mapEventToQuota(ctx context.Context, obj client.Object) []reconcile.Request {
 	evt, ok := obj.(*corev1.Event)

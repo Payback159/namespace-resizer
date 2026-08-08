@@ -19,7 +19,7 @@ import (
 	"github.com/payback159/namespace-resizer/internal/lock"
 )
 
-func TestAnalyzeEvents(t *testing.T) {
+func TestCollectDeficits(t *testing.T) {
 	// Setup Scheme
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
@@ -29,6 +29,10 @@ func TestAnalyzeEvents(t *testing.T) {
 	// 1. Setup Objects
 	nsName := "demo-ns"
 	quotaName := "demo-quota"
+
+	cpuReq := resource.MustParse("200m")
+	memReq := resource.MustParse("100Mi")
+	storageReq := resource.MustParse("1Gi")
 
 	quota := &corev1.ResourceQuota{
 		ObjectMeta: metav1.ObjectMeta{
@@ -64,8 +68,8 @@ func TestAnalyzeEvents(t *testing.T) {
 							Name: "main",
 							Resources: corev1.ResourceRequirements{
 								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("200m"),
-									corev1.ResourceMemory: resource.MustParse("100Mi"),
+									corev1.ResourceCPU:    cpuReq,
+									corev1.ResourceMemory: memReq,
 								},
 							},
 						},
@@ -77,7 +81,7 @@ func TestAnalyzeEvents(t *testing.T) {
 					Spec: corev1.PersistentVolumeClaimSpec{
 						Resources: corev1.VolumeResourceRequirements{
 							Requests: corev1.ResourceList{
-								corev1.ResourceStorage: resource.MustParse("1Gi"),
+								corev1.ResourceStorage: storageReq,
 							},
 						},
 					},
@@ -119,58 +123,20 @@ func TestAnalyzeEvents(t *testing.T) {
 		Locker: lock.NewLeaseLocker(client),
 	}
 
-	// Config
-	config := ResizerConfig{
-		Thresholds:       map[corev1.ResourceName]float64{"default": 80.0},
-		IncrementFactors: map[corev1.ResourceName]float64{"default": 0.2},
-		Cooldown:         time.Minute,
-	}
-
 	// Set Logger
 	ctx := context.Background()
 	logger := zap.New(zap.UseDevMode(true))
 	ctx = ctrl.LoggerInto(ctx, logger)
 
-	// Run analyzeEvents
-	recs, err := r.analyzeEvents(ctx, *quota, config)
+	// Run collectDeficits
+	deficits, err := r.collectDeficits(ctx, *quota, time.Time{})
 	assert.NoError(t, err)
 
 	// Assertions
-	// We expect CPU recommendation:
-	// Deficit per pod: 200m. Missing replicas: 3. Total deficit: 600m.
-	// Base need: 0 + 600m = 600m.
-	// Buffer: 600m * 0.2 = 120m.
-	// Total: 720m.
-	// Current Limit: 100m.
-	// Recommendation: 720m.
-
-	if val, ok := recs[corev1.ResourceRequestsCPU]; ok {
-		assert.Equal(t, "720m", val.String())
-	} else {
-		assert.Fail(t, "CPU recommendation missing")
-	}
-
-	// We also expect Memory recommendation (Smart Calc includes all resources in PodSpec)
-	// Deficit per pod: 100Mi. Total: 300Mi.
-	// Buffer: 60Mi. Total: 360Mi.
-	if val, ok := recs[corev1.ResourceRequestsMemory]; ok {
-		assert.Equal(t, "360Mi", val.String())
-	} else {
-		assert.Fail(t, "Memory recommendation missing")
-	}
-
-	// We also expect Storage recommendation (Smart Calc includes PVCs)
-	// Deficit per pod: 1Gi. Total: 3Gi.
-	// Used: 1Gi.
-	// Base: 1Gi + 3Gi = 4Gi.
-	// Buffer: 4Gi * 0.2 = 0.8Gi = 819Mi (approx).
-	// Total: 4.8Gi.
-	if val, ok := recs[corev1.ResourceRequestsStorage]; ok {
-		// 4Gi + 20% = 4.8Gi = 4915Mi approx
-		// 4 * 1024 = 4096. 4096 * 1.2 = 4915.2
-		// 4916Mi
-		assert.Equal(t, "4916Mi", val.String())
-	} else {
-		assert.Fail(t, "Storage recommendation missing")
-	}
+	// Deficit per pod: 200m CPU, 100Mi Memory, 1Gi Storage (from the PVC
+	// template). Missing replicas: 3. The raw deficit is Requested * missing,
+	// independent of Used — the buffer/target math now lives in sizing.Decide.
+	assert.Equal(t, cpuReq.MilliValue()*3, deficits[corev1.ResourceRequestsCPU], "CPU deficit should be 600m")
+	assert.Equal(t, memReq.MilliValue()*3, deficits[corev1.ResourceRequestsMemory], "Memory deficit should be 300Mi")
+	assert.Equal(t, storageReq.MilliValue()*3, deficits[corev1.ResourceRequestsStorage], "Storage deficit should be 3Gi")
 }
