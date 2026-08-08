@@ -50,6 +50,29 @@ func TestQuantize(t *testing.T) {
 			format: resource.BinarySI,
 			want:   "5Mi",
 		},
+		{
+			// A storage-class scoped key counts claims. The scope contains
+			// the word "storage", which must not route it into bytes.
+			name:   "storage-class scoped claim count stays an integer",
+			res:    corev1.ResourceName("gold.storageclass.storage.k8s.io/persistentvolumeclaims"),
+			milli:  11250,
+			format: resource.DecimalSI,
+			want:   "12",
+		},
+		{
+			name:   "storage-class scoped storage request stays bytes",
+			res:    corev1.ResourceName("gold.storageclass.storage.k8s.io/requests.storage"),
+			milli:  5 * 1024 * 1024 * 1000,
+			format: resource.BinarySI,
+			want:   "5Mi",
+		},
+		{
+			name:   "count/ key whose group contains storage stays an integer",
+			res:    corev1.ResourceName("count/csistoragecapacities.storage.k8s.io"),
+			milli:  3200,
+			format: resource.DecimalSI,
+			want:   "4",
+		},
 	}
 
 	for _, tc := range cases {
@@ -69,6 +92,8 @@ func TestIsCountable(t *testing.T) {
 		corev1.ResourceSecrets,
 		corev1.ResourcePersistentVolumeClaims,
 		corev1.ResourceName("count/jobs.batch"),
+		corev1.ResourceName("count/csistoragecapacities.storage.k8s.io"),
+		corev1.ResourceName("gold.storageclass.storage.k8s.io/persistentvolumeclaims"),
 	}
 	for _, res := range countable {
 		if !IsCountable(res) {
@@ -80,6 +105,7 @@ func TestIsCountable(t *testing.T) {
 		corev1.ResourceRequestsCPU,
 		corev1.ResourceLimitsMemory,
 		corev1.ResourceRequestsStorage,
+		corev1.ResourceName("gold.storageclass.storage.k8s.io/requests.storage"),
 	}
 	for _, res := range divisible {
 		if IsCountable(res) {
