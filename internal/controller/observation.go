@@ -25,6 +25,11 @@ type Observer struct {
 	locker *lock.LeaseLocker
 	now    func() time.Time
 
+	// mu protects only the cached map, never spanning API calls. controller-runtime
+	// never reconciles the same object concurrently, so two Observe calls for the
+	// same key cannot overlap; only the map entry (key) itself needs protection, not
+	// reads or writes to the window's content. Different keys require only the map's
+	// internal synchronization to be safe.
 	mu     sync.Mutex
 	cached map[string]sizing.Window
 }
@@ -43,7 +48,9 @@ func NewObserver(locker *lock.LeaseLocker, now func() time.Time) *Observer {
 
 // Observe records one sample and returns the current window. A cold cache — a
 // freshly started controller — falls back to the persisted window, so the first
-// sample after a restart correctly measures the outage as a gap.
+// sample after a restart correctly measures the outage as a gap. The returned
+// Window shares its backing slice and maps with the observer's cached copy and
+// must be treated as a read-only snapshot.
 func (o *Observer) Observe(
 	ctx context.Context,
 	quota *corev1.ResourceQuota,
@@ -51,10 +58,11 @@ func (o *Observer) Observe(
 ) (sizing.Window, error) {
 	key := quota.Namespace + "/" + quota.Name
 
+	// Read from cache, releasing the lock before API calls.
 	o.mu.Lock()
-	defer o.mu.Unlock()
-
 	window, cached := o.cached[key]
+	o.mu.Unlock()
+
 	if !cached {
 		state, err := o.locker.GetState(ctx, quota.Namespace, quota.Name)
 		if err != nil {
@@ -80,7 +88,11 @@ func (o *Observer) Observe(
 		}
 	}
 
+	// Cache the updated window.
+	o.mu.Lock()
 	o.cached[key] = window
+	o.mu.Unlock()
+
 	return window, nil
 }
 
