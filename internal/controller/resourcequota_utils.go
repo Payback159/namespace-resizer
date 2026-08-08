@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -33,6 +32,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"github.com/payback159/namespace-resizer/internal/sizing"
 )
 
 const defaultKey = "default"
@@ -180,40 +181,6 @@ func parseConfig(annotations map[string]string) ResizerConfig {
 	return config
 }
 
-func parseEventMessage(message string) (corev1.ResourceName, resource.Quantity, error) {
-	// Parse message: "exceeded quota: my-quota, requested: cpu=1, used: cpu=10, limited: cpu=10"
-	parts := strings.Split(message, ",")
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if strings.HasPrefix(part, "requested: ") {
-			// "requested: cpu=500m"
-			reqPart := strings.TrimPrefix(part, "requested: ")
-			// "cpu=500m"
-			kv := strings.Split(reqPart, "=")
-			if len(kv) == 2 {
-				resName := corev1.ResourceName(kv[0])
-				reqQty, err := resource.ParseQuantity(kv[1])
-				if err == nil {
-					return resName, reqQty, nil
-				}
-			}
-		}
-	}
-	return "", resource.Quantity{}, fmt.Errorf("failed to parse message")
-}
-
-func getWorkloadKey(name string) string {
-	// Heuristic: Strip the last segment (after the last hyphen) to identify the workload.
-	// e.g. "app-a-6b474476c4-xfg2z" -> "app-a-6b474476c4" (ReplicaSet name)
-	// e.g. "app-b-deployment-12345" -> "app-b-deployment"
-	// e.g. "web-0" -> "web" (StatefulSet)
-	lastHyphen := strings.LastIndex(name, "-")
-	if lastHyphen == -1 {
-		return name
-	}
-	return name[:lastHyphen]
-}
-
 func convertToReadableFormat(resName corev1.ResourceName, milliValue int64, format resource.Format) resource.Quantity {
 	if strings.Contains(string(resName), "memory") || strings.Contains(string(resName), "storage") {
 		// Memory/Storage Fix: Convert from Milli-Bytes back to Bytes
@@ -298,7 +265,7 @@ func (r *ResourceQuotaReconciler) mapEventToQuota(ctx context.Context, obj clien
 }
 
 func (r *ResourceQuotaReconciler) calculateWorkloadDeficit(ctx context.Context, evt corev1.Event, failedRes corev1.ResourceName, failedQty resource.Quantity) (string, map[corev1.ResourceName]int64) {
-	key := getWorkloadKey(evt.InvolvedObject.Name)
+	key := sizing.WorkloadKey(evt.InvolvedObject.Name)
 	logger := log.FromContext(ctx)
 
 	// Default: just the failed resource from the event
@@ -314,11 +281,11 @@ func (r *ResourceQuotaReconciler) calculateWorkloadDeficit(ctx context.Context, 
 
 		// 1. Calculate Pod Resources (CPU, Memory)
 		// Effective Request = Max(Max(Init), Sum(Containers))
-		reqs := getPodRequests(podSpec)
+		reqs := sizing.PodRequests(podSpec)
 
 		// 2. Calculate Storage Resources (if PVC templates exist)
 		if len(pvcTemplates) > 0 {
-			pvcReqs := getPVCRequests(pvcTemplates)
+			pvcReqs := sizing.PVCRequests(pvcTemplates)
 			for k, v := range pvcReqs {
 				reqs[k] += v
 			}
@@ -398,111 +365,6 @@ func (r *ResourceQuotaReconciler) calculateWorkloadDeficit(ctx context.Context, 
 	}
 
 	return key, deficits
-}
-
-func getPodRequests(spec corev1.PodSpec) map[corev1.ResourceName]int64 {
-	reqs := make(map[corev1.ResourceName]int64)
-
-	// Helper to add resources with proper mapping
-	addResources := func(list corev1.ResourceList, isLimit bool) {
-		for name, qty := range list {
-			key := name
-			if isLimit {
-				switch name {
-				case corev1.ResourceCPU:
-					key = corev1.ResourceLimitsCPU
-				case corev1.ResourceMemory:
-					key = corev1.ResourceLimitsMemory
-				}
-			} else {
-				switch name {
-				case corev1.ResourceCPU:
-					key = corev1.ResourceRequestsCPU
-				case corev1.ResourceMemory:
-					key = corev1.ResourceRequestsMemory
-				case corev1.ResourceStorage:
-					key = corev1.ResourceRequestsStorage
-				}
-			}
-			reqs[key] += qty.MilliValue()
-		}
-	}
-
-	// 1. Sum of App Containers
-	for _, c := range spec.Containers {
-		addResources(c.Resources.Requests, false)
-		addResources(c.Resources.Limits, true)
-	}
-
-	// 2. Max of Init Containers (Effective Request logic)
-	// Note: For limits, the logic is similar (max of init vs sum of app).
-	// However, K8s resource formula is complex.
-	// For simplicity/safety in Quota resizing, taking the MAX of Init Containers
-	// and adding it to the App Containers (if Init is larger) is a safe upper bound.
-	// But strictly speaking: Effective = max( max(init), sum(app) )
-	// Our current logic was: sum(app) + max(init - sum(app), 0) ?
-	// No, the previous logic was:
-	// reqs[name] += qty (for app)
-	// if val > reqs[name] { reqs[name] = val } (for init)
-	// This implements max(sum(app), max(init)). Correct.
-
-	// We need to do this per-resource-key.
-	// Since we now map keys, we can just iterate and compare.
-	for _, c := range spec.InitContainers {
-		// We need a temporary map for this init container to handle the mapping
-		initReqs := make(map[corev1.ResourceName]int64)
-
-		// Helper for single container
-		addInit := func(list corev1.ResourceList, isLimit bool) {
-			for name, qty := range list {
-				key := name
-				if isLimit {
-					switch name {
-					case corev1.ResourceCPU:
-						key = corev1.ResourceLimitsCPU
-					case corev1.ResourceMemory:
-						key = corev1.ResourceLimitsMemory
-					}
-				} else {
-					switch name {
-					case corev1.ResourceCPU:
-						key = corev1.ResourceRequestsCPU
-					case corev1.ResourceMemory:
-						key = corev1.ResourceRequestsMemory
-					case corev1.ResourceStorage:
-						key = corev1.ResourceRequestsStorage
-					}
-				}
-				initReqs[key] = qty.MilliValue()
-			}
-		}
-
-		addInit(c.Resources.Requests, false)
-		addInit(c.Resources.Limits, true)
-
-		// Compare with current total
-		for k, v := range initReqs {
-			if v > reqs[k] {
-				reqs[k] = v
-			}
-		}
-	}
-	return reqs
-}
-
-func getPVCRequests(templates []corev1.PersistentVolumeClaim) map[corev1.ResourceName]int64 {
-	reqs := make(map[corev1.ResourceName]int64)
-	for _, pvc := range templates {
-		// Requests
-		for name, qty := range pvc.Spec.Resources.Requests {
-			key := name
-			if name == corev1.ResourceStorage {
-				key = corev1.ResourceRequestsStorage
-			}
-			reqs[key] += qty.MilliValue()
-		}
-	}
-	return reqs
 }
 
 func (r *ResourceQuotaReconciler) isObjectAlive(ctx context.Context, ref corev1.ObjectReference, namespace string) bool {

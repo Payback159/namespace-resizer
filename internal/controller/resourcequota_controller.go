@@ -36,6 +36,7 @@ import (
 	resizerConfig "github.com/payback159/namespace-resizer/internal/config"
 	"github.com/payback159/namespace-resizer/internal/git"
 	"github.com/payback159/namespace-resizer/internal/lock"
+	"github.com/payback159/namespace-resizer/internal/sizing"
 )
 
 // ResourceQuotaReconciler reconciles a ResourceQuota object
@@ -396,7 +397,7 @@ func (r *ResourceQuotaReconciler) analyzeEvents(ctx context.Context, quota corev
 		}
 
 		// 1. Parse Message
-		resName, reqQty, err := parseEventMessage(evt.Message)
+		resName, reqQty, err := sizing.ParseEventMessage(evt.Message)
 		if err != nil {
 			logger.Error(err, "Failed to parse event message", "message", evt.Message)
 			continue
