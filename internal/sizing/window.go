@@ -111,7 +111,11 @@ func (w *Window) Observe(
 	// The gap is measured against the previous sample regardless of which day
 	// it fell on, so an outage spanning midnight invalidates the new day too.
 	if last, err := time.Parse(time.RFC3339, w.LastSampleAt); err == nil {
-		if gap := stamp.Sub(last); gap > parseGap(bucket.MaxGap) {
+		gap := stamp.Sub(last)
+		// A stored value that cannot be parsed is left untouched: covered()
+		// rejects the day, and overwriting it here would quietly repair a
+		// bucket whose real observation history is unknown.
+		if previous, ok := parseGap(bucket.MaxGap); ok && gap > previous {
 			bucket.MaxGap = gap.Truncate(time.Second).String()
 		}
 	}
@@ -181,7 +185,15 @@ func (w Window) IsComplete(res corev1.ResourceName, now time.Time, windowDays in
 		if !ok || !bucket.covered() {
 			return false
 		}
-		if _, ok := bucket.Peaks[string(res)]; !ok {
+		raw, ok := bucket.Peaks[string(res)]
+		if !ok {
+			return false
+		}
+		// Peak silently skips a value it cannot parse. Accepting the day here
+		// would let the window claim to be complete while the peak was
+		// computed from fewer days than it reports — a lower peak on
+		// supposedly full history, which is what makes a quota shrink too far.
+		if _, err := resource.ParseQuantity(raw); err != nil {
 			return false
 		}
 	}
@@ -195,7 +207,8 @@ func (b DayBucket) covered() bool {
 	if b.First == "" || b.Last == "" {
 		return false
 	}
-	if parseGap(b.MaxGap) > dayCoverageMaxGap {
+	gap, ok := parseGap(b.MaxGap)
+	if !ok || gap > dayCoverageMaxGap {
 		return false
 	}
 	return b.First <= coverageFirstBy && b.Last >= coverageLastBy
@@ -230,13 +243,17 @@ func (w Window) indexOf(date string) int {
 	return -1
 }
 
-func parseGap(raw string) time.Duration {
+// parseGap reads a stored gap. It reports ok=false when the value cannot be
+// parsed, so callers reject the day instead of reading a corrupt value as "no
+// gap at all". That is the dangerous direction: it would make a barely
+// observed day look perfectly covered.
+func parseGap(raw string) (time.Duration, bool) {
 	if raw == "" {
-		return 0
+		return 0, true
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
-		return 0
+		return 0, false
 	}
-	return d
+	return d, true
 }

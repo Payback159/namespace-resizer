@@ -158,6 +158,85 @@ func TestWindow_DropsFutureBuckets(t *testing.T) {
 	}
 }
 
+func TestWindow_ObserveRecordsOutage(t *testing.T) {
+	now := time.Date(2026, 8, 8, 6, 0, 0, 0, time.UTC)
+	w := Window{Version: WindowVersion}
+
+	w.Observe(now, testUID, used("4"), 14)
+	w.Observe(now.Add(6*time.Hour), testUID, used("4"), 14)
+
+	// The gap has to be recorded by Observe itself. Every other coverage test
+	// sets MaxGap by hand, which would hide a regression here.
+	if got := w.Days[0].MaxGap; got != "6h0m0s" {
+		t.Fatalf("maxGap = %q, want 6h0m0s", got)
+	}
+	if w.Days[0].covered() {
+		t.Fatal("day counts as covered after a six-hour outage")
+	}
+}
+
+func TestWindow_OutageAcrossMidnightFailsBothDays(t *testing.T) {
+	evening := time.Date(2026, 8, 6, 20, 0, 0, 0, time.UTC)
+	w := Window{Version: WindowVersion}
+
+	w.Observe(evening, testUID, used("4"), 14)
+	w.Observe(evening.Add(8*time.Hour), testUID, used("4"), 14)
+
+	if len(w.Days) != 2 {
+		t.Fatalf("days = %d, want 2", len(w.Days))
+	}
+	if w.Days[0].covered() {
+		t.Error("the day before the outage counts as covered")
+	}
+	if got := w.Days[1].MaxGap; got != "8h0m0s" {
+		t.Errorf("new day maxGap = %q, want 8h0m0s", got)
+	}
+	if w.Days[1].covered() {
+		t.Error("the day after the outage counts as covered")
+	}
+}
+
+func TestWindow_PartiallySampledDayIsRejected(t *testing.T) {
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	w := fillWindow(now, 14, "4")
+
+	// A controller that ran for ten minutes leaves a bucket that exists but
+	// was never observed to the end of the day. Counting it would be exactly
+	// the false confidence the window is meant to prevent.
+	short := now.UTC().AddDate(0, 0, -5).Format(dateLayout)
+	for i := range w.Days {
+		if w.Days[i].Date == short {
+			w.Days[i].Last = "00:10"
+		}
+	}
+
+	if w.IsComplete(corev1.ResourceRequestsCPU, now, 14) {
+		t.Fatal("IsComplete = true for a day sampled only until 00:10")
+	}
+}
+
+func TestWindow_CorruptStoredValuesFailClosed(t *testing.T) {
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+
+	t.Run("unreadable maxGap rejects the day", func(t *testing.T) {
+		w := fillWindow(now, 14, "4")
+		w.Days[3].MaxGap = "not-a-duration"
+
+		if w.IsComplete(corev1.ResourceRequestsCPU, now, 14) {
+			t.Fatal("IsComplete = true despite an unreadable maxGap")
+		}
+	})
+
+	t.Run("unreadable peak rejects the window", func(t *testing.T) {
+		w := fillWindow(now, 14, "4")
+		w.Days[3].Peaks[string(corev1.ResourceRequestsCPU)] = "not-a-quantity"
+
+		if w.IsComplete(corev1.ResourceRequestsCPU, now, 14) {
+			t.Fatal("IsComplete = true despite an unreadable peak value")
+		}
+	})
+}
+
 func TestWindow_ObserveReportsChange(t *testing.T) {
 	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
 	w := Window{Version: WindowVersion}
