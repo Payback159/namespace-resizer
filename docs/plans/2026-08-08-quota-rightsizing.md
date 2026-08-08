@@ -3872,13 +3872,46 @@ type shrinkHarness struct {
 	locker     *lock.LeaseLocker
 }
 
+// shortageObjects returns the event and the owning ReplicaSet that make
+// collectDeficits report a pending shortage of the given size. The ReplicaSet
+// has to exist because the controller ignores events whose involved object is
+// already gone, and it leaves Spec.Replicas nil so the deficit comes straight
+// from the event message rather than from a replica calculation.
+func shortageObjects(requestedCPU string) []client.Object {
+	return []client.Object{
+		&appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{Name: "web-abc123", Namespace: "team-a"},
+		},
+		&corev1.Event{
+			ObjectMeta: metav1.ObjectMeta{Name: "shortage", Namespace: "team-a"},
+			Type:       corev1.EventTypeWarning,
+			Reason:     "FailedCreate",
+			Message: "exceeded quota: compute, requested: requests.cpu=" +
+				requestedCPU + ", used: requests.cpu=4, limited: requests.cpu=16",
+			InvolvedObject: corev1.ObjectReference{
+				Kind:       "ReplicaSet",
+				APIVersion: "apps/v1",
+				Name:       "web-abc123",
+				Namespace:  "team-a",
+			},
+			LastTimestamp: metav1.NewTime(time.Now()),
+		},
+	}
+}
+
 // newShrinkHarness builds a reconciler whose quota is heavily oversized
-// (hard 16, used 4) with shrinking enabled.
-func newShrinkHarness(t *testing.T, status *git.PRStatus) *shrinkHarness {
+// (hard 16, used 4) with shrinking enabled. Extra objects are seeded into the
+// fake client, which is how a test stages a pending shortage.
+func newShrinkHarness(
+	t *testing.T,
+	status *git.PRStatus,
+	extra ...client.Object,
+) *shrinkHarness {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
 	_ = coordinationv1.AddToScheme(scheme)
 
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a"}}
@@ -3896,7 +3929,8 @@ func newShrinkHarness(t *testing.T, status *git.PRStatus) *shrinkHarness {
 		},
 	}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ns, quota).Build()
+	objects := append([]client.Object{ns, quota}, extra...)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 	locker := lock.NewLeaseLocker(c)
 	provider := &FakeGitProvider{PRStatus: status, CreatePRID: 43}
 
@@ -3926,19 +3960,16 @@ func TestShrink_SupersededByAShortage(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
 
+	// A pending shortage of 20 CPU turns the decision into a grow.
 	h := newShrinkHarness(t, &git.PRStatus{
 		IsOpen:    true,
 		CreatedAt: time.Now().Add(-3 * 24 * time.Hour),
-	})
+	}, shortageObjects("20")...)
+
 	g.Expect(h.locker.MutateState(ctx, "team-a", "compute", func(s *lock.State) {
 		s.PRID = 42
 		s.PRDirection = git.DirectionShrink
 	})).To(Succeed())
-
-	// A pending shortage turns the decision into a grow.
-	h.reconciler.deficitOverride = map[corev1.ResourceName]int64{
-		corev1.ResourceRequestsCPU: 20000,
-	}
 
 	g.Expect(h.reconcile(ctx)).To(Succeed())
 
@@ -3997,29 +4028,18 @@ func TestShrink_YoungPRIsLeftAlone(t *testing.T) {
 }
 ```
 
-The test sets `deficitOverride`. Add it to the reconciler as a test seam —
-scanning real events would need a fully populated event list and a live
-workload, which is exactly the kind of setup the sizing package was extracted
-to avoid:
+The shortage is staged with real objects rather than a test hook in the
+reconciler: production structs must not carry fields that exist only for
+tests. `shortageObjects` supplies the two things `collectDeficits` insists
+on — a parseable `FailedCreate` event and a live involved object.
 
-```go
-	// deficitOverride short-circuits event scanning in tests. It is never set
-	// in production wiring.
-	deficitOverride map[corev1.ResourceName]int64
-```
-
-and at the top of `collectDeficits`:
-
-```go
-	if r.deficitOverride != nil {
-		return r.deficitOverride, nil
-	}
-```
+The new imports for this file are `appsv1 "k8s.io/api/apps/v1"` and
+`"sigs.k8s.io/controller-runtime/pkg/client"`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `go test ./internal/controller/... -run TestShrink -v`
-Expected: build failure — `unknown field CreatedAt`, `deficitOverride`.
+Expected: build failure — `unknown field CreatedAt in struct literal`.
 
 - [ ] **Step 3: Expose the PR creation time**
 
