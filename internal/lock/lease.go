@@ -18,6 +18,15 @@ const (
 	ControllerNamespace = "namespace-resizer-system"
 	// AnnotationLastModified stores the timestamp of the last successful resize action
 	AnnotationLastModified = "resizer.io/last-modified"
+	// AnnotationLastGrow stores when the controller last proposed a growth.
+	AnnotationLastGrow = "resizer.io/last-grow"
+	// AnnotationLastShrink stores when the controller last proposed, closed or
+	// expired a shrink. It drives the shrink cooldown gate.
+	AnnotationLastShrink = "resizer.io/last-shrink"
+	// AnnotationPRDirection records whether the open PR grows or shrinks.
+	AnnotationPRDirection = "resizer.io/pr-direction"
+	// AnnotationWindow stores the JSON-encoded observation window.
+	AnnotationWindow = "resizer.io/observation-window"
 
 	// Lease label keys/value used to identify resizer-managed state leases.
 	labelManagedBy = "app.kubernetes.io/managed-by"
