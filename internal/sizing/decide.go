@@ -115,7 +115,7 @@ func Decide(in Input) Decision {
 			growReasons = append(growReasons,
 				describe(res, hard, qty, driver))
 
-		case driver == "configured minimum" || float64(targetMilli) < float64(hardMilli)*(1-in.Policy.Tolerance):
+		case float64(targetMilli) < float64(hardMilli)*(1-in.Policy.Tolerance):
 			capped := int64(float64(hardMilli) * (1 - in.Policy.MaxShrinkStep))
 			if capped > targetMilli {
 				targetMilli = capped

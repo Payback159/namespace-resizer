@@ -96,9 +96,12 @@ func TestDecide_HardFloorFromCurrentUsage(t *testing.T) {
 }
 
 func TestDecide_MinAnnotationIsRespected(t *testing.T) {
+	// Demand alone would justify shrinking all the way to the step cap of 12.
+	// The configured minimum of 13 stops it one notch short, and 13 is still
+	// below the shrink threshold of 16 * 0.85 = 13.6, so a shrink happens.
 	in := baseInput("16", "1", "1")
 	in.Policy.Min = map[corev1.ResourceName]resource.Quantity{
-		corev1.ResourceRequestsCPU: resource.MustParse("14"),
+		corev1.ResourceRequestsCPU: resource.MustParse("13"),
 	}
 
 	got := Decide(in)
@@ -106,8 +109,26 @@ func TestDecide_MinAnnotationIsRespected(t *testing.T) {
 	if got.Direction != DirectionShrink {
 		t.Fatalf("direction = %v, want shrink", got.Direction)
 	}
-	if want := "14"; targetCPU(t, got) != want {
-		t.Fatalf("target = %s, want %s (min annotation)", targetCPU(t, got), want)
+	if want := "13"; targetCPU(t, got) != want {
+		t.Fatalf("target = %s, want %s (min annotation, not the step cap of 12)",
+			targetCPU(t, got), want)
+	}
+}
+
+func TestDecide_MinAnnotationCanCloseTheBand(t *testing.T) {
+	// A minimum of 14 lifts the target into the tolerance band around the
+	// current limit of 16 (13.6 .. 18.4). The minimum raises the target; it
+	// does not authorise a change that the band forbids.
+	in := baseInput("16", "1", "1")
+	in.Policy.Min = map[corev1.ResourceName]resource.Quantity{
+		corev1.ResourceRequestsCPU: resource.MustParse("14"),
+	}
+
+	got := Decide(in)
+
+	if got.Direction != DirectionNone {
+		t.Fatalf("direction = %v, want none — target 14 sits inside the band",
+			got.Direction)
 	}
 }
 
