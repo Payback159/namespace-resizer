@@ -8,19 +8,20 @@ import (
 	. "github.com/onsi/gomega"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-func newStateLocker() *LeaseLocker {
+func newStateLocker() (*LeaseLocker, client.Client) {
 	scheme := runtime.NewScheme()
 	_ = coordinationv1.AddToScheme(scheme)
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
-	return NewLeaseLocker(c)
+	return NewLeaseLocker(c), c
 }
 
 func TestGetState_MissingLeaseIsZero(t *testing.T) {
 	g := NewWithT(t)
-	locker := newStateLocker()
+	locker, _ := newStateLocker()
 
 	state, err := locker.GetState(context.Background(), testNamespace, testQuotaName)
 
@@ -33,14 +34,18 @@ func TestGetState_MissingLeaseIsZero(t *testing.T) {
 
 func TestMutateState_RoundTrip(t *testing.T) {
 	g := NewWithT(t)
-	locker := newStateLocker()
+	locker, _ := newStateLocker()
 	ctx := context.Background()
+	modifiedAt := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
 	grownAt := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
+	shrunkAt := time.Date(2026, 8, 5, 14, 30, 0, 0, time.UTC)
 
 	err := locker.MutateState(ctx, testNamespace, testQuotaName, func(s *State) {
 		s.PRID = 42
 		s.PRDirection = "shrink"
+		s.LastModified = modifiedAt
 		s.LastGrow = grownAt
+		s.LastShrink = shrunkAt
 		s.Window = `{"v":1,"days":[]}`
 	})
 	g.Expect(err).NotTo(HaveOccurred())
@@ -49,13 +54,15 @@ func TestMutateState_RoundTrip(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(state.PRID).To(Equal(42))
 	g.Expect(state.PRDirection).To(Equal("shrink"))
+	g.Expect(state.LastModified.Equal(modifiedAt)).To(BeTrue())
 	g.Expect(state.LastGrow.Equal(grownAt)).To(BeTrue())
+	g.Expect(state.LastShrink.Equal(shrunkAt)).To(BeTrue())
 	g.Expect(state.Window).To(Equal(`{"v":1,"days":[]}`))
 }
 
 func TestMutateState_ClearingPRIDReleasesTheLock(t *testing.T) {
 	g := NewWithT(t)
-	locker := newStateLocker()
+	locker, c := newStateLocker()
 	ctx := context.Background()
 
 	g.Expect(locker.MutateState(ctx, testNamespace, testQuotaName, func(s *State) {
@@ -74,11 +81,20 @@ func TestMutateState_ClearingPRIDReleasesTheLock(t *testing.T) {
 	g.Expect(state.PRID).To(Equal(0))
 	g.Expect(state.PRDirection).To(BeEmpty())
 	g.Expect(state.LastShrink.IsZero()).To(BeFalse())
+
+	// Verify that the pr-direction annotation key is actually deleted, not just empty.
+	var lease coordinationv1.Lease
+	key := client.ObjectKey{
+		Name:      "state-" + testNamespace + "-" + testQuotaName,
+		Namespace: ControllerNamespace,
+	}
+	g.Expect(c.Get(ctx, key, &lease)).To(Succeed())
+	g.Expect(lease.Annotations).NotTo(HaveKey(AnnotationPRDirection))
 }
 
 func TestMutateState_PreservesExistingLastModified(t *testing.T) {
 	g := NewWithT(t)
-	locker := newStateLocker()
+	locker, _ := newStateLocker()
 	ctx := context.Background()
 	modified := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
 
