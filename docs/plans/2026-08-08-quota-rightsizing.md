@@ -985,6 +985,85 @@ func TestWindow_DropsFutureBuckets(t *testing.T) {
 	}
 }
 
+func TestWindow_ObserveRecordsOutage(t *testing.T) {
+	now := time.Date(2026, 8, 8, 6, 0, 0, 0, time.UTC)
+	w := Window{Version: WindowVersion}
+
+	w.Observe(now, testUID, used("4"), 14)
+	w.Observe(now.Add(6*time.Hour), testUID, used("4"), 14)
+
+	// The gap has to be recorded by Observe itself. Every other coverage test
+	// sets MaxGap by hand, which would hide a regression here.
+	if got := w.Days[0].MaxGap; got != "6h0m0s" {
+		t.Fatalf("maxGap = %q, want 6h0m0s", got)
+	}
+	if w.Days[0].covered() {
+		t.Fatal("day counts as covered after a six-hour outage")
+	}
+}
+
+func TestWindow_OutageAcrossMidnightFailsBothDays(t *testing.T) {
+	evening := time.Date(2026, 8, 6, 20, 0, 0, 0, time.UTC)
+	w := Window{Version: WindowVersion}
+
+	w.Observe(evening, testUID, used("4"), 14)
+	w.Observe(evening.Add(8*time.Hour), testUID, used("4"), 14)
+
+	if len(w.Days) != 2 {
+		t.Fatalf("days = %d, want 2", len(w.Days))
+	}
+	if w.Days[0].covered() {
+		t.Error("the day before the outage counts as covered")
+	}
+	if got := w.Days[1].MaxGap; got != "8h0m0s" {
+		t.Errorf("new day maxGap = %q, want 8h0m0s", got)
+	}
+	if w.Days[1].covered() {
+		t.Error("the day after the outage counts as covered")
+	}
+}
+
+func TestWindow_PartiallySampledDayIsRejected(t *testing.T) {
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	w := fillWindow(now, 14, "4")
+
+	// A controller that ran for ten minutes leaves a bucket that exists but
+	// was never observed to the end of the day. Counting it would be exactly
+	// the false confidence the window is meant to prevent.
+	short := now.UTC().AddDate(0, 0, -5).Format(dateLayout)
+	for i := range w.Days {
+		if w.Days[i].Date == short {
+			w.Days[i].Last = "00:10"
+		}
+	}
+
+	if w.IsComplete(corev1.ResourceRequestsCPU, now, 14) {
+		t.Fatal("IsComplete = true for a day sampled only until 00:10")
+	}
+}
+
+func TestWindow_CorruptStoredValuesFailClosed(t *testing.T) {
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+
+	t.Run("unreadable maxGap rejects the day", func(t *testing.T) {
+		w := fillWindow(now, 14, "4")
+		w.Days[3].MaxGap = "not-a-duration"
+
+		if w.IsComplete(corev1.ResourceRequestsCPU, now, 14) {
+			t.Fatal("IsComplete = true despite an unreadable maxGap")
+		}
+	})
+
+	t.Run("unreadable peak rejects the window", func(t *testing.T) {
+		w := fillWindow(now, 14, "4")
+		w.Days[3].Peaks[string(corev1.ResourceRequestsCPU)] = "not-a-quantity"
+
+		if w.IsComplete(corev1.ResourceRequestsCPU, now, 14) {
+			t.Fatal("IsComplete = true despite an unreadable peak value")
+		}
+	})
+}
+
 func TestWindow_ObserveReportsChange(t *testing.T) {
 	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
 	w := Window{Version: WindowVersion}
@@ -1124,7 +1203,11 @@ func (w *Window) Observe(
 	// The gap is measured against the previous sample regardless of which day
 	// it fell on, so an outage spanning midnight invalidates the new day too.
 	if last, err := time.Parse(time.RFC3339, w.LastSampleAt); err == nil {
-		if gap := stamp.Sub(last); gap > parseGap(bucket.MaxGap) {
+		gap := stamp.Sub(last)
+		// A stored value that cannot be parsed is left untouched: covered()
+		// rejects the day, and overwriting it here would quietly repair a
+		// bucket whose real observation history is unknown.
+		if previous, ok := parseGap(bucket.MaxGap); ok && gap > previous {
 			bucket.MaxGap = gap.Truncate(time.Second).String()
 		}
 	}
@@ -1194,7 +1277,15 @@ func (w Window) IsComplete(res corev1.ResourceName, now time.Time, windowDays in
 		if !ok || !bucket.covered() {
 			return false
 		}
-		if _, ok := bucket.Peaks[string(res)]; !ok {
+		raw, ok := bucket.Peaks[string(res)]
+		if !ok {
+			return false
+		}
+		// Peak silently skips a value it cannot parse. Accepting the day here
+		// would let the window claim to be complete while the peak was
+		// computed from fewer days than it reports — a lower peak on
+		// supposedly full history, which is what makes a quota shrink too far.
+		if _, err := resource.ParseQuantity(raw); err != nil {
 			return false
 		}
 	}
@@ -1208,7 +1299,8 @@ func (b DayBucket) covered() bool {
 	if b.First == "" || b.Last == "" {
 		return false
 	}
-	if parseGap(b.MaxGap) > dayCoverageMaxGap {
+	gap, ok := parseGap(b.MaxGap)
+	if !ok || gap > dayCoverageMaxGap {
 		return false
 	}
 	return b.First <= coverageFirstBy && b.Last >= coverageLastBy
@@ -1243,15 +1335,19 @@ func (w Window) indexOf(date string) int {
 	return -1
 }
 
-func parseGap(raw string) time.Duration {
+// parseGap reads a stored gap. It reports ok=false when the value cannot be
+// parsed, so callers reject the day instead of reading a corrupt value as "no
+// gap at all". That is the dangerous direction: it would make a barely
+// observed day look perfectly covered.
+func parseGap(raw string) (time.Duration, bool) {
 	if raw == "" {
-		return 0
+		return 0, true
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
-		return 0
+		return 0, false
 	}
-	return d
+	return d, true
 }
 ```
 
