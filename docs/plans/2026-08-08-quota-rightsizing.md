@@ -1939,10 +1939,14 @@ func Decide(in Input) Decision {
 			continue
 		}
 
-		usedMilli := int64(0)
-		if u, ok := in.Used[res]; ok {
-			usedMilli = u.MilliValue()
+		used, ok := in.Used[res]
+		if !ok {
+			// A hard key the API server has not reported usage for. Reading
+			// the usage as zero would make it a shrink candidate aiming at
+			// nothing, so skip it exactly as the metric loop this replaces did.
+			continue
 		}
+		usedMilli := used.MilliValue()
 
 		headroom := in.Policy.HeadroomFor(res)
 		targetMilli, driver := targetFor(in, res, usedMilli, headroom)
@@ -2934,9 +2938,15 @@ section:
 	}
 
 	deficits, err := r.collectDeficits(ctx, quota, state.LastModified)
+	deficitScanFailed := err != nil
 	if err != nil {
 		// A failed event scan must not stop the metric-driven path; it only
 		// means a pending shortage may be reacted to one reconcile later.
+		//
+		// It is not symmetric, though: a missing deficit can only lower the
+		// target, so a failed scan could tip a quota from "no action" into
+		// "shrink". The shrink branch below therefore requires a successful
+		// scan.
 		logger.Error(err, "failed to collect event deficits")
 	}
 
@@ -2967,9 +2977,16 @@ section:
 
 	if decision.Direction == sizing.DirectionShrink {
 		// Shrink PRs are wired up in the shrink-PR task. Until then the
-		// decision is observable through metrics only.
-		logger.Info("Shrink recommended but not yet actionable",
-			"targets", decision.Targets)
+		// decision is observable through metrics only. deficitScanFailed is
+		// already checked here so the guard exists before the shrink branch
+		// becomes actionable.
+		if deficitScanFailed {
+			logger.Info("Shrink suppressed: the event scan failed, so the " +
+				"target may be understated")
+		} else {
+			logger.Info("Shrink recommended but not yet actionable",
+				"targets", decision.Targets)
+		}
 	}
 
 	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
@@ -3093,10 +3110,17 @@ func resolveQuotaKey(
 
 Inside them, replace:
 - `prID` with `state.PRID`
-- `needsResize` with `decision.Direction != sizing.DirectionNone`
+- `needsResize` with `decision.Direction == sizing.DirectionGrow`
 - `recommendations` with `decision.Targets`
 - `config.Cooldown` with `policy.GrowCooldown`
 - `r.Locker.GetLastModified(...)` with `state.LastModified`
+
+The `UpdatePR` guard is `== DirectionGrow`, not `!= DirectionNone`. Anything
+looser lets a shrink decision rewrite an open grow pull request with lowered
+limits, which the auto-merge block directly above would then merge — breaking
+the rule that a shrink is never auto-merged, before shrink pull requests are
+even supposed to exist. The shrink-PR task widens this deliberately, together
+with the direction state that makes it safe.
 
 In `handleNewProposal`, after a successful `CreatePR`, replace the
 `AcquireLock` call so the grow timestamp is recorded in the same write:
