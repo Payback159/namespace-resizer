@@ -55,6 +55,16 @@ func TestRecordDecision_ClearsStaleGates(t *testing.T) {
 		Direction: sizing.DirectionNone,
 		BlockedBy: []sizing.Gate{sizing.GateCooldown},
 	})
+
+	// Assert the gate went up first. Without this, a recordDecision that did
+	// nothing at all would satisfy the assertion below, because reading an
+	// unset gauge yields zero.
+	blocked := testutil.ToFloat64(shrinkBlockedBy.WithLabelValues(
+		"team-a", "compute", "cooldown"))
+	if blocked != 1 {
+		t.Fatalf("gate = %v after a blocked decision, want 1", blocked)
+	}
+
 	recordDecision("team-a", "compute", hard, sizing.Decision{
 		Direction: sizing.DirectionGrow,
 		Targets: map[corev1.ResourceName]resource.Quantity{
@@ -66,5 +76,39 @@ func TestRecordDecision_ClearsStaleGates(t *testing.T) {
 		"team-a", "compute", "cooldown"))
 	if got != 0 {
 		t.Fatalf("stale gate still set to %v, want 0", got)
+	}
+}
+
+func TestRecordDecision_ClearsResolvedTargets(t *testing.T) {
+	quotaTarget.Reset()
+	quotaWasteRatio.Reset()
+
+	hard := corev1.ResourceList{
+		corev1.ResourceRequestsCPU: resource.MustParse("16"),
+	}
+
+	recordDecision("team-a", "compute", hard, sizing.Decision{
+		Direction: sizing.DirectionNone,
+		ShrinkPreview: map[corev1.ResourceName]resource.Quantity{
+			corev1.ResourceRequestsCPU: resource.MustParse("4"),
+		},
+		BlockedBy: []sizing.Gate{sizing.GateEnabled},
+	})
+
+	if got := testutil.CollectAndCount(quotaWasteRatio); got != 1 {
+		t.Fatalf("waste ratio series = %d, want 1 after a shrink preview", got)
+	}
+
+	// The quota now tracks demand: no target, so the series must disappear
+	// rather than freeze at a waste ratio that is no longer true.
+	recordDecision("team-a", "compute", hard, sizing.Decision{
+		Direction: sizing.DirectionNone,
+	})
+
+	if got := testutil.CollectAndCount(quotaWasteRatio); got != 0 {
+		t.Fatalf("waste ratio series = %d, want 0 once the target is gone", got)
+	}
+	if got := testutil.CollectAndCount(quotaTarget); got != 0 {
+		t.Fatalf("target series = %d, want 0 once the target is gone", got)
 	}
 }

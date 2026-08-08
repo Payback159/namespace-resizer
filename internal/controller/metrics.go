@@ -69,15 +69,23 @@ func recordDecision(
 		targets = decision.ShrinkPreview
 	}
 
-	for res, target := range targets {
+	// Iterate the quota's own keys, not the targets, so a resource that no
+	// longer needs one has its series removed instead of left behind. A gauge
+	// frozen at its last value would keep reporting waste that has already
+	// been resolved — the mirror image of the stale gate this function is
+	// careful to avoid below.
+	for res, current := range hard {
 		labels := []string{namespace, quota, string(res)}
-		targetMilli := target.MilliValue()
-		quotaTarget.WithLabelValues(labels...).Set(float64(targetMilli))
 
-		current, ok := hard[res]
-		if !ok || targetMilli == 0 {
+		target, wanted := targets[res]
+		targetMilli := target.MilliValue()
+		if !wanted || targetMilli == 0 {
+			quotaTarget.DeleteLabelValues(labels...)
+			quotaWasteRatio.DeleteLabelValues(labels...)
 			continue
 		}
+
+		quotaTarget.WithLabelValues(labels...).Set(float64(targetMilli))
 		quotaWasteRatio.WithLabelValues(labels...).
 			Set(float64(current.MilliValue()) / float64(targetMilli))
 	}
