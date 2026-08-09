@@ -173,6 +173,87 @@ func TestParsePolicy_ShrinkOptOutApplies(t *testing.T) {
 	}
 }
 
+func TestParsePolicy_ShrinkOptOut_TrueLeavesFlagAlone(t *testing.T) {
+	cases := []struct {
+		name string
+		flag bool
+	}{
+		{name: "flag on stays on", flag: true},
+		{name: "flag off stays off", flag: false}, // the security property
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := DefaultPolicy()
+			base.ShrinkEnabled = tc.flag
+
+			p, warnings := ParsePolicy(map[string]string{
+				"resizer.io/shrink-enabled": "true",
+			}, base)
+
+			if p.ShrinkEnabled != tc.flag {
+				t.Fatalf("ShrinkEnabled = %v, want %v (unchanged from the flag)",
+					p.ShrinkEnabled, tc.flag)
+			}
+			if len(warnings) != 0 {
+				t.Errorf("warnings = %v, want none", warnings)
+			}
+		})
+	}
+}
+
+func TestParsePolicy_ShrinkOptOut_FalseVariantsOptOut(t *testing.T) {
+	for _, value := range []string{"false", "False"} {
+		t.Run(value, func(t *testing.T) {
+			base := DefaultPolicy()
+			base.ShrinkEnabled = true
+
+			p, warnings := ParsePolicy(map[string]string{
+				"resizer.io/shrink-enabled": value,
+			}, base)
+
+			if p.ShrinkEnabled {
+				t.Fatalf("value %q did not opt out", value)
+			}
+			if len(warnings) != 0 {
+				t.Errorf("warnings = %v, want none", warnings)
+			}
+		})
+	}
+}
+
+func TestParsePolicy_ShrinkOptOut_UnrecognisedValueOptsOutWithWarning(t *testing.T) {
+	base := DefaultPolicy()
+	base.ShrinkEnabled = true
+
+	p, warnings := ParsePolicy(map[string]string{
+		"resizer.io/shrink-enabled": "disabled",
+	}, base)
+
+	if p.ShrinkEnabled {
+		t.Fatal("unrecognised value did not opt out")
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %v, want exactly one", warnings)
+	}
+}
+
+func TestParsePolicy_ShrinkOptOut_EmptyValueOptsOut(t *testing.T) {
+	base := DefaultPolicy()
+	base.ShrinkEnabled = true
+
+	p, warnings := ParsePolicy(map[string]string{
+		"resizer.io/shrink-enabled": "",
+	}, base)
+
+	if p.ShrinkEnabled {
+		t.Fatal("empty value did not opt out")
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %v, want exactly one", warnings)
+	}
+}
+
 func TestHeadroomFor_FamilyFallback(t *testing.T) {
 	p, _ := ParsePolicy(map[string]string{
 		"resizer.io/cpu-headroom": "0.6",

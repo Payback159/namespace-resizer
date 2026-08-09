@@ -16,7 +16,10 @@ const AnnotationPrefix = "resizer.io/"
 // DefaultKey is the map key holding the namespace-wide fallback value.
 const DefaultKey corev1.ResourceName = "default"
 
-const falseValue = "false"
+const (
+	trueValue  = "true"
+	falseValue = "false"
+)
 
 // Policy is the effective configuration for one quota, after merging global
 // defaults with namespace annotations.
@@ -87,7 +90,10 @@ func resourceFamily(res corev1.ResourceName) (corev1.ResourceName, bool) {
 	return "", false
 }
 
-func parseScalar(name, value string, out *Policy) {
+// parseScalar applies one non-headroom, non-increment, non-threshold
+// annotation and returns a warning string, empty when there is nothing to
+// say.
+func parseScalar(name, value string, out *Policy) string {
 	switch {
 	case strings.HasSuffix(name, "-min"):
 		if q, err := resource.ParseQuantity(value); err == nil {
@@ -120,11 +126,31 @@ func parseScalar(name, value string, out *Policy) {
 	case name == "enabled":
 		out.Enabled = value != falseValue
 	case name == "shrink-enabled":
-		// Opt-out only: a namespace may switch shrinking off, never on.
-		// Enabling it is the operator's decision, made with the flag.
-		if value == falseValue {
-			out.ShrinkEnabled = false
-		}
+		return parseShrinkOptOut(value, out)
+	}
+	return ""
+}
+
+// parseShrinkOptOut applies the shrink-enabled annotation, which is opt-out
+// only: a namespace may switch shrinking off, never on. Enabling it is the
+// operator's decision, made with the flag.
+//
+// Only an explicit "true" leaves shrinking as the flag left it. Every other
+// value switches it off, because the sole reason to write this annotation is
+// to opt out, and a spelling we do not recognise is far likelier to be an
+// attempt at that than a request to keep shrinking on.
+func parseShrinkOptOut(value string, out *Policy) string {
+	switch {
+	case strings.EqualFold(value, trueValue):
+		return ""
+	case strings.EqualFold(value, falseValue):
+		out.ShrinkEnabled = false
+		return ""
+	default:
+		out.ShrinkEnabled = false
+		return fmt.Sprintf("annotation %sshrink-enabled has the unrecognised "+
+			"value %q, so shrinking is switched off for this namespace; "+
+			"use \"true\" or \"false\"", AnnotationPrefix, value)
 	}
 }
 
@@ -162,7 +188,9 @@ func ParsePolicy(annotations map[string]string, base Policy) (Policy, []string) 
 				fromThreshold[suffixKey(name, "threshold")] = 100.0/v - 1.0
 			}
 		default:
-			parseScalar(name, value, &out)
+			if w := parseScalar(name, value, &out); w != "" {
+				warnings = append(warnings, w)
+			}
 		}
 	}
 
