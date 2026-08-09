@@ -14,18 +14,34 @@ Der Controller implementiert einen **Reconciliation Loop**, der `ResourceQuota` 
 **Datenquellen:**
 - `ResourceQuota.status.hard`: Das konfigurierte Limit.
 - `ResourceQuota.status.used`: Der aktuelle Verbrauch.
+- Das Beobachtungsfenster (Tages-Peaks der letzten `window-days` Tage, siehe
+  Abschnitt 4 im [Design-Dokument](design/2026-08-08-quota-rightsizing.md)).
 
 **Trigger-Logik:**
-Ein Resize-Event wird ausgelöst, wenn für eine Ressource (z.B. `requests.cpu`, `limits.memory`) gilt:
+Es gibt keinen isolierten Auslastungs-Schwellenwert mehr. Für jede Ressource
+berechnet der Controller einen Zielwert (Formel siehe 2.2) und vergleicht ihn
+mit einem Toleranzband um das aktuelle Limit:
 
-$$ \frac{\text{used}}{\text{hard}} \times 100 \ge \text{Threshold}_{\%} $$
+$$ \text{Target} > \text{hard} \times (1 + \text{Toleranz}) \implies \text{Grow} $$
 
-*Beispiel:*
+$$ \text{Target} < \text{hard} \times (1 - \text{Toleranz}) \implies \text{Shrink-Kandidat} $$
+
+$$ \text{sonst} \implies \text{keine Aktion} $$
+
+*Beispiel (Default-Werte: Headroom 25 %, Toleranz 15 %):*
 - Limit: 10 CPU
-- Used: 8.5 CPU
-- Threshold: 80%
-- Berechnung: $8.5 / 10 = 85\%$.
-- **Ergebnis:** Trigger ausgelöst (da $85\% \ge 80\%$).
+- Verbrauch: 8.5 CPU (85 % Auslastung)
+- Zielwert: $8.5 \times 1.25 = 10.625$
+- Grow-Schwelle: $10 \times 1.15 = 11.5$ — Zielwert liegt darunter.
+- Shrink-Schwelle: $10 \times 0.85 = 8.5$ — Zielwert liegt darüber.
+- **Ergebnis:** Kein Trigger. Unter der früheren, rein Threshold-basierten
+  Logik hätte dieselbe Auslastung (85 % ≥ 80 %) noch eine Erhöhung ausgelöst —
+  das ist die sichtbarste Verhaltensänderung dieses Modells, siehe
+  [OPERATIONS.md](OPERATIONS.md) Abschnitt 2.
+
+  Bei diesen Defaults überschreitet der Zielwert die Grow-Schwelle erst ab
+  rund 92 % Auslastung (z.B. 9.3 CPU: Zielwert $9.3 \times 1.25 = 11.625 >
+  11.5$ → Trigger).
 
 ### 2.2. Berechnung (Calculation)
 
@@ -46,10 +62,9 @@ die Obergrenze bildet. Das Limit folgt dem Bedarf in beide Richtungen.
 1.  **Headroom**: Puffer über dem beobachteten Bedarf (Default: 0.25, also 25 %).
 2.  **Tolerance**: Toleranzband um den Zielwert, das Flapping strukturell ausschließt (Default: 0.15, also 15 %).
 
-Die früheren Parameter `Threshold` und `IncrementFactor` (Abschnitt 2.1)
-funktionieren als Annotationen weiter und werden intern auf `Headroom`
-abgebildet — Details und die Migrationstabelle stehen in
-[INSTALLATION.md](INSTALLATION.md).
+Die früheren Parameter `Threshold` und `IncrementFactor` funktionieren als
+Annotationen weiter und werden intern auf `Headroom` abgebildet — Details und
+die Migrationstabelle stehen in [INSTALLATION.md](INSTALLATION.md).
 
 ### 2.4. Sicherheits-Mechanismen (Guardrails)
 
@@ -84,9 +99,14 @@ Der Controller arbeitet nach dem Prinzip **"Opt-Out"**. Das bedeutet, er überwa
 
 **1. Global Defaults:**
 Der Controller startet mit globalen Standardwerten (konfigurierbar via CLI-Flags oder ConfigMap), z.B.:
-*   Threshold: 80%
-*   Increment: 20%
+*   Headroom: 0.25 (25 %)
+*   Toleranz: 0.15 (15 %)
 *   Cooldown: 60m
+
+Die älteren Parameter `Threshold` und `Increment` sind keine eigenen Defaults
+mehr, sondern Migrations-Eingaben: Wer sie weiterhin setzt, bekommt sie intern
+in einen Headroom-Wert umgerechnet, statt dass sie eine eigene Logik auslösen
+(siehe 2.2 und die Migrationstabelle in [INSTALLATION.md](INSTALLATION.md)).
 
 **2. Namespace Overrides (Annotations):**
 Einzelne Namespaces können diese Werte überschreiben oder sich komplett vom Resizing ausschließen.
@@ -102,8 +122,8 @@ Einzelne Namespaces können diese Werte überschreiben oder sich komplett vom Re
     ```yaml
     metadata:
       annotations:
-        resizer.io/cpu-threshold: "90"      # Erst ab 90% reagieren
-        resizer.io/cpu-increment: "10%"     # Vorsichtiger erhöhen
+        resizer.io/cpu-headroom: "0.4"      # Mehr Puffer für CPU
+        resizer.io/tolerance: "0.1"         # Engeres Toleranzband
     ```
 
 *Empfehlung für Phase 1:* Wir implementieren die Annotation-Logik. CRDs werden vorerst nicht benötigt.

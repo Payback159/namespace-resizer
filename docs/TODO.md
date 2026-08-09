@@ -47,7 +47,7 @@
 - [x] Tests für Auto-Merge Logik
 
 ## Phase 7: Future Work
-- [ ] Metrics Export (Prometheus)
+- [x] Metrics Export (Prometheus)
 - [ ] Webhook für Validierung
 
 ## Phase 8: Bidirektionales Quota-Rightsizing (Abgeschlossen)

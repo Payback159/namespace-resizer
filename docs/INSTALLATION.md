@@ -85,7 +85,11 @@ Headroom-Wert übersetzt, mit folgender Rangfolge pro Resource:
 4. Sonst gilt der Default `0.25`.
 
 Eine gesetzte, aber veraltete Annotation erzeugt beim ersten Reconcile eine
-Deprecation-Warnung im Log, ändert das Ergebnis aber nicht.
+Deprecation-Warnung im Log, ändert das Ergebnis aber nicht — außer wenn für
+dieselbe Resource zusätzlich eine `headroom`-Annotation (oder, für
+`threshold`, zusätzlich eine `increment`-Annotation) gesetzt ist: Dann
+gewinnt diese nach der Rangfolge oben ohnehin, und die veraltete Annotation
+erzeugt keine Warnung, weil sie das Ergebnis gar nicht mehr beeinflusst.
 
 ### Authentifizierung (GitHub)
 
