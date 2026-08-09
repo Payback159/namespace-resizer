@@ -120,7 +120,11 @@ func parseScalar(name, value string, out *Policy) {
 	case name == "enabled":
 		out.Enabled = value != falseValue
 	case name == "shrink-enabled":
-		out.ShrinkEnabled = value != falseValue
+		// Opt-out only: a namespace may switch shrinking off, never on.
+		// Enabling it is the operator's decision, made with the flag.
+		if value == falseValue {
+			out.ShrinkEnabled = false
+		}
 	}
 }
 

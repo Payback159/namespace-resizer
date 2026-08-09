@@ -145,6 +145,34 @@ func TestParsePolicy_ScalarsAndMin(t *testing.T) {
 	}
 }
 
+func TestParsePolicy_ShrinkOptOutCannotOverrideTheFlag(t *testing.T) {
+	// The global flag is expressed as the base policy. A namespace may opt
+	// out of shrinking, but it may not opt in when the operator disabled it.
+	base := DefaultPolicy()
+	base.ShrinkEnabled = false
+
+	p, _ := ParsePolicy(map[string]string{
+		"resizer.io/shrink-enabled": "true",
+	}, base)
+
+	if p.ShrinkEnabled {
+		t.Fatal("namespace annotation enabled shrinking against the global flag")
+	}
+}
+
+func TestParsePolicy_ShrinkOptOutApplies(t *testing.T) {
+	base := DefaultPolicy()
+	base.ShrinkEnabled = true
+
+	p, _ := ParsePolicy(map[string]string{
+		"resizer.io/shrink-enabled": "false",
+	}, base)
+
+	if p.ShrinkEnabled {
+		t.Fatal("namespace opt-out was ignored")
+	}
+}
+
 func TestHeadroomFor_FamilyFallback(t *testing.T) {
 	p, _ := ParsePolicy(map[string]string{
 		"resizer.io/cpu-headroom": "0.6",
