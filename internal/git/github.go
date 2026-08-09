@@ -17,6 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 var ErrFileNotFound = errors.New("file not found")
@@ -29,15 +30,31 @@ const (
 	ChecksStateSuccess = "success"
 )
 
+// Pull request directions. They are persisted as a GitHub label so an
+// orphaned PR can be classified without any local state.
+const (
+	DirectionGrow   = "grow"
+	DirectionShrink = "shrink"
+
+	labelManaged         = "resizer/managed"
+	labelDirectionPrefix = "resizer/direction:"
+)
+
 type Provider interface {
 	GetPRStatus(ctx context.Context, prID int) (*PRStatus, error)
 	MergePR(ctx context.Context, prID int, method string) error
-	CreatePR(ctx context.Context, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error)
-	UpdatePR(ctx context.Context, prID int, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) error
-	// FindOpenPR returns the number of an existing open PR managed by the resizer
-	// for the given namespace/quota, or 0 if none exists. It is used to recover
-	// from orphaned PRs (created but never locked) and avoid opening duplicates.
-	FindOpenPR(ctx context.Context, namespace, quotaName string) (int, error)
+	CreatePR(ctx context.Context, quotaName, namespace, direction string,
+		annotations map[string]string,
+		newLimits map[corev1.ResourceName]resource.Quantity) (int, error)
+	UpdatePR(ctx context.Context, prID int, quotaName, namespace string,
+		annotations map[string]string,
+		newLimits map[corev1.ResourceName]resource.Quantity) error
+	// FindOpenPR returns the number and the direction of an existing open PR
+	// managed by the resizer, or 0 and an empty direction if none exists.
+	FindOpenPR(ctx context.Context, namespace, quotaName string) (int, string, error)
+	// ClosePR posts comment on the pull request and then closes it without
+	// merging.
+	ClosePR(ctx context.Context, prID int, comment string) error
 }
 
 type PRStatus struct {
@@ -47,6 +64,9 @@ type PRStatus struct {
 	MergeableState   string
 	ChecksState      string
 	ChecksTotalCount int
+	// CreatedAt is when the pull request was opened. The shrink TTL is
+	// measured against it.
+	CreatedAt time.Time
 }
 
 type GitHubProvider struct {
@@ -145,6 +165,7 @@ func (g *GitHubProvider) GetPRStatus(ctx context.Context, prID int) (*PRStatus, 
 		MergeableState:   pr.GetMergeableState(),
 		ChecksState:      checksState,
 		ChecksTotalCount: checksTotalCount,
+		CreatedAt:        pr.GetCreatedAt().Time,
 	}, nil
 }
 
@@ -158,7 +179,7 @@ func (g *GitHubProvider) MergePR(ctx context.Context, prID int, method string) e
 	return err
 }
 
-func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error) {
+func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace, direction string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) (int, error) {
 	// 1. Get default branch ref
 	repo, _, err := g.client.Repositories.Get(ctx, g.owner, g.repo)
 	if err != nil {
@@ -170,7 +191,24 @@ func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace stri
 	}
 
 	// 2. Create new branch
-	branchName := fmt.Sprintf("resize/%s-%s-%d", namespace, quotaName, time.Now().Unix())
+	//
+	// The branch name carries the direction. It is created atomically with the
+	// pull request (this same call), so unlike the direction label — a
+	// separate API call that can fail on its own — it can never end up
+	// out of sync with what the pull request actually does. See
+	// FindOpenPR and directionFromLabels for how the label still serves as
+	// the fallback for pull requests opened before this encoding existed.
+	//
+	// The segments are joined with "/", not "-": the legacy shape
+	// (resize/<namespace>-<quota>-<timestamp>) already used "-" as its
+	// separator, so a namespace or quota name that happens to start with
+	// "grow-" or "shrink-" can make a legacy branch byte-identical to a
+	// new-shape one for a *different* namespace/quota pair (namespace
+	// "shrink-team" legacy vs. namespace "team" new-shape shrink both
+	// produce "resize/shrink-team-...-<ts>"). Kubernetes object names cannot
+	// contain "/", so that collision is structurally impossible once "/"
+	// separates the new shape's segments.
+	branchName := fmt.Sprintf("resize/%s/%s/%s/%d", direction, namespace, quotaName, time.Now().Unix())
 	newRef := github.CreateRef{
 		Ref: "refs/heads/" + branchName,
 		SHA: baseRef.Object.GetSHA(),
@@ -213,8 +251,12 @@ func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace stri
 	}
 
 	// 6. Create PR
+	title := fmt.Sprintf("Resize Quota %s in %s", quotaName, namespace)
+	if direction == DirectionShrink {
+		title = fmt.Sprintf("Shrink Quota %s in %s", quotaName, namespace)
+	}
 	newPR := &github.NewPullRequest{
-		Title:               github.Ptr(fmt.Sprintf("Resize Quota %s in %s", quotaName, namespace)),
+		Title:               github.Ptr(title),
 		Head:                github.Ptr(branchName),
 		Base:                github.Ptr(repo.GetDefaultBranch()),
 		Body:                github.Ptr(generatePRBody(namespace, quotaName, newLimits)),
@@ -227,13 +269,68 @@ func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace stri
 	}
 
 	// 7. Add Labels
-	_, _, err = g.client.Issues.AddLabelsToIssue(ctx, g.owner, g.repo, pr.GetNumber(), []string{"resizer/managed", fmt.Sprintf("resizer/ns:%s", namespace)})
-	if err != nil {
-		// Log error but don't fail the whole flow
-		fmt.Printf("Failed to add labels: %v\n", err)
+	labels := []string{
+		labelManaged,
+		fmt.Sprintf("resizer/ns:%s", namespace),
+		labelDirectionPrefix + direction,
+	}
+	if err := g.addLabels(ctx, pr.GetNumber(), labels); err != nil {
+		logger := log.FromContext(ctx)
+		if direction != DirectionShrink {
+			// A grow pull request with no label is recovered as grow anyway,
+			// so the only cost is a less precise audit trail.
+			logger.Error(err, "failed to label pull request",
+				"pr", pr.GetNumber(), "direction", direction)
+			return pr.GetNumber(), nil
+		}
+		// An unlabelled shrink is indistinguishable from a grow once this
+		// process forgets it, and grow pull requests are the ones eligible
+		// for auto-merge. Take the pull request back rather than leave a
+		// mergeable shrink behind.
+		logger.Error(err, "failed to label shrink pull request, closing it again",
+			"pr", pr.GetNumber())
+		if closeErr := g.ClosePR(ctx, pr.GetNumber(), unlabelledShrinkComment); closeErr != nil {
+			return 0, fmt.Errorf(
+				"failed to label shrink PR %d (%w) and failed to close it again: %w",
+				pr.GetNumber(), err, closeErr)
+		}
+		return 0, fmt.Errorf("failed to label shrink PR %d, closed it again: %w",
+			pr.GetNumber(), err)
 	}
 
 	return pr.GetNumber(), nil
+}
+
+const unlabelledShrinkComment = "Closing this pull request: its direction " +
+	"label could not be attached, and an unlabelled shrink proposal would " +
+	"later be mistaken for a growth proposal. A replacement will be opened " +
+	"on the next reconcile."
+
+// labelAttempts is how often CreatePR tries to attach the labels before it
+// treats the failure as final.
+const labelAttempts = 3
+
+// labelRetryBackoff is a variable so tests can zero it.
+var labelRetryBackoff = 500 * time.Millisecond
+
+func (g *GitHubProvider) addLabels(ctx context.Context, prNumber int, labels []string) error {
+	var err error
+	for attempt := 1; attempt <= labelAttempts; attempt++ {
+		if _, _, err = g.client.Issues.AddLabelsToIssue(
+			ctx, g.owner, g.repo, prNumber, labels); err == nil {
+			return nil
+		}
+		if attempt == labelAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("labelling PR %d cancelled: %w", prNumber, ctx.Err())
+		case <-time.After(labelRetryBackoff):
+		}
+	}
+	return fmt.Errorf("failed to label PR %d after %d attempts: %w",
+		prNumber, labelAttempts, err)
 }
 
 func (g *GitHubProvider) UpdatePR(ctx context.Context, prID int, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) error {
@@ -296,24 +393,66 @@ func (g *GitHubProvider) UpdatePR(ctx context.Context, prID int, quotaName, name
 	return nil
 }
 
-// FindOpenPR lists open pull requests and returns the number of the one whose
-// head branch matches the deterministic resizer branch prefix for the given
-// namespace/quota. Returns 0 if no matching open PR exists.
-func (g *GitHubProvider) FindOpenPR(ctx context.Context, namespace, quotaName string) (int, error) {
-	prefix := fmt.Sprintf("resize/%s-%s-", namespace, quotaName)
+// FindOpenPR lists open pull requests and returns the number and direction of
+// the one whose head branch matches the deterministic resizer branch prefix
+// for the given namespace/quota. Returns 0 and an empty direction if no
+// matching open PR exists.
+//
+// The direction is read from the branch name whenever the branch was created
+// with it encoded (see CreatePR): that is structurally reliable, since the
+// branch and the pull request are created in the same call and cannot drift
+// apart. A branch predating that encoding falls back to directionFromLabels,
+// the same recovery path used before this function knew about branch-encoded
+// directions — an in-flight pull request from before the upgrade must still
+// be found, not orphaned.
+//
+// The new-shape prefixes use "/" as their segment separator (see CreatePR):
+// a Kubernetes namespace or quota name cannot contain "/", so
+// growPrefix/shrinkPrefix can never match a legacyPrefix branch from a
+// different namespace/quota pair — unlike an all-"-" scheme, where namespace
+// "shrink-team" and namespace "team" could otherwise both produce
+// "resize/shrink-team-...".
+//
+// A legacy match is only ever a fallback, never a first-past-the-post win.
+// The legacy shape is ambiguous in a way the new one is not — "resize/team-a-
+// compute-…" belongs to namespace "team-a" quota "compute" and to namespace
+// "team" quota "a-compute" alike — so a namespace that has its own new-shape
+// pull request must adopt that one regardless of where GitHub happens to list
+// the two. Deciding per pull request would hand the outcome to list order and
+// let a namespace adopt a neighbour's pull request, then update, close or
+// merge it.
+func (g *GitHubProvider) FindOpenPR(ctx context.Context, namespace, quotaName string) (int, string, error) {
+	growPrefix := fmt.Sprintf("resize/%s/%s/%s/", DirectionGrow, namespace, quotaName)
+	shrinkPrefix := fmt.Sprintf("resize/%s/%s/%s/", DirectionShrink, namespace, quotaName)
+	legacyPrefix := fmt.Sprintf("resize/%s-%s-", namespace, quotaName)
 	opts := &github.PullRequestListOptions{
 		State:       "open",
 		ListOptions: github.ListOptions{PerPage: 100},
 	}
 
+	legacyID := 0
+	legacyDirection := ""
+
 	for {
 		prs, resp, err := g.client.PullRequests.List(ctx, g.owner, g.repo, opts)
 		if err != nil {
-			return 0, fmt.Errorf("failed to list pull requests: %w", err)
+			return 0, "", fmt.Errorf("failed to list pull requests: %w", err)
 		}
 		for _, pr := range prs {
-			if pr.Head != nil && strings.HasPrefix(pr.Head.GetRef(), prefix) {
-				return pr.GetNumber(), nil
+			if pr.Head == nil {
+				continue
+			}
+			ref := pr.Head.GetRef()
+			switch {
+			case strings.HasPrefix(ref, growPrefix):
+				return pr.GetNumber(), DirectionGrow, nil
+			case strings.HasPrefix(ref, shrinkPrefix):
+				return pr.GetNumber(), DirectionShrink, nil
+			case strings.HasPrefix(ref, legacyPrefix):
+				if legacyID == 0 {
+					legacyID = pr.GetNumber()
+					legacyDirection = directionFromLabels(pr.Labels)
+				}
 			}
 		}
 		if resp.NextPage == 0 {
@@ -321,7 +460,58 @@ func (g *GitHubProvider) FindOpenPR(ctx context.Context, namespace, quotaName st
 		}
 		opts.Page = resp.NextPage
 	}
-	return 0, nil
+	if legacyID != 0 {
+		return legacyID, legacyDirection, nil
+	}
+	return 0, "", nil
+}
+
+// directionFromLabels reads the direction label and never invents a value it
+// did not recognise.
+//
+// No direction label at all means the pull request predates the label;
+// classifying it as grow preserves the behaviour those pull requests were
+// opened under. A label that is present but is not exactly "grow" is a
+// different case: labels are writable by anyone with repository access, so an
+// unrecognised value is evidence that something other than this controller
+// wrote it. Reading it as shrink is the safe direction — shrink proposals are
+// never auto-merged, so the cost of being wrong is one human review, whereas
+// reading it as grow would cost an unreviewed merge of lowered limits.
+//
+// For the same reason every direction label is inspected rather than the first
+// one found. Nothing stops a second one being added next to the label this
+// controller wrote, and stopping at the first match would let a grow label
+// pinned onto a genuine shrink decide the outcome by list order alone.
+func directionFromLabels(labels []*github.Label) string {
+	for _, label := range labels {
+		name := label.GetName()
+		if !strings.HasPrefix(name, labelDirectionPrefix) {
+			continue
+		}
+		if strings.TrimPrefix(name, labelDirectionPrefix) != DirectionGrow {
+			return DirectionShrink
+		}
+	}
+	// Either no direction label at all, or every one of them said grow.
+	return DirectionGrow
+}
+
+// ClosePR records why the pull request is being abandoned and then closes it.
+// The comment is posted first: if closing fails the reason is still visible,
+// whereas a closed PR with no explanation is confusing for reviewers.
+func (g *GitHubProvider) ClosePR(ctx context.Context, prID int, comment string) error {
+	body := &github.IssueComment{Body: github.Ptr(comment)}
+	if _, _, err := g.client.Issues.CreateComment(
+		ctx, g.owner, g.repo, prID, body); err != nil {
+		return fmt.Errorf("failed to comment on PR %d: %w", prID, err)
+	}
+
+	update := &github.PullRequest{State: github.Ptr("closed")}
+	if _, _, err := g.client.PullRequests.Edit(
+		ctx, g.owner, g.repo, prID, update); err != nil {
+		return fmt.Errorf("failed to close PR %d: %w", prID, err)
+	}
+	return nil
 }
 
 func (g *GitHubProvider) findQuotaFile(ctx context.Context, basePath, ref, quotaName string) (string, *github.RepositoryContent, error) {

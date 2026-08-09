@@ -65,9 +65,9 @@ func TestAcquireLock_RetriesOnUpdateConflict(t *testing.T) {
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(atomic.LoadInt32(&updateCalls)).To(BeNumerically(">=", 2), "update should have been retried")
 
-	id, err := locker.GetLock(ctx, testNamespace, testQuotaName)
+	state, err := locker.GetState(ctx, testNamespace, testQuotaName)
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(id).To(Equal(99))
+	g.Expect(state.PRID).To(Equal(99))
 }
 
 // TestAcquireLock_RetriesOnAlreadyExists verifies that losing the create race
@@ -102,9 +102,9 @@ func TestAcquireLock_RetriesOnAlreadyExists(t *testing.T) {
 	err := locker.AcquireLock(ctx, testNamespace, testQuotaName, 7)
 	g.Expect(err).ToNot(HaveOccurred())
 
-	id, err := locker.GetLock(ctx, testNamespace, testQuotaName)
+	state, err := locker.GetState(ctx, testNamespace, testQuotaName)
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(id).To(Equal(7))
+	g.Expect(state.PRID).To(Equal(7))
 }
 
 // TestAcquireLock_RejectsForeignHolder verifies a lease already held by a

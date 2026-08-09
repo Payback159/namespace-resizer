@@ -40,6 +40,7 @@ import (
 	"github.com/payback159/namespace-resizer/internal/controller"
 	"github.com/payback159/namespace-resizer/internal/git"
 	"github.com/payback159/namespace-resizer/internal/lock"
+	"github.com/payback159/namespace-resizer/internal/sizing"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -70,6 +71,7 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var enableAutoMerge bool
+	var enableShrink bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -91,6 +93,10 @@ func main() {
 
 	flag.BoolVar(&enableAutoMerge, "enable-auto-merge", os.Getenv("ENABLE_AUTO_MERGE") == trueStr,
 		"If set, the controller will automatically merge Pull Requests if checks pass.")
+	flag.BoolVar(&enableShrink, "enable-shrink", os.Getenv("ENABLE_SHRINK") == trueStr,
+		"If set, the controller opens pull requests that lower quotas. When "+
+			"unset it still computes and exports the recommendation, so the "+
+			"effect can be reviewed through metrics before enabling it.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -265,6 +271,11 @@ func main() {
 
 	locker := lock.NewLeaseLocker(mgr.GetClient())
 
+	basePolicy := sizing.DefaultPolicy()
+	basePolicy.ShrinkEnabled = enableShrink
+
+	observer := controller.NewObserver(locker, time.Now)
+
 	// Start Lease Garbage Collector (runs every 12 hours)
 	gc := lock.NewLeaseGarbageCollector(mgr.GetClient(), 12*time.Hour)
 	if err := mgr.Add(gc); err != nil {
@@ -280,6 +291,8 @@ func main() {
 		Recorder:        mgr.GetEventRecorderFor("namespace-resizer"), //nolint:staticcheck // legacy events API
 		GitProvider:     gitProvider,
 		Locker:          locker,
+		Observer:        observer,
+		BasePolicy:      basePolicy,
 		EnableAutoMerge: enableAutoMerge,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ResourceQuota")

@@ -18,11 +18,7 @@ package controller
 
 import (
 	"context"
-	"fmt"
-	"math"
-	"strconv"
 	"strings"
-	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -33,9 +29,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-)
 
-const defaultKey = "default"
+	"github.com/payback159/namespace-resizer/internal/sizing"
+)
 
 // Kubernetes event reason and involved-object kinds handled by event analysis.
 const (
@@ -45,191 +41,6 @@ const (
 	kindReplicaSet     = "ReplicaSet"
 	kindPod            = "Pod"
 )
-
-type ResizerConfig struct {
-	Thresholds       map[corev1.ResourceName]float64
-	IncrementFactors map[corev1.ResourceName]float64
-	Cooldown         time.Duration
-}
-
-func (c ResizerConfig) GetThreshold(res corev1.ResourceName) float64 {
-	// Check for specific resource match
-	if v, ok := c.Thresholds[res]; ok {
-		return v
-	}
-
-	// Check for resource type match (e.g. requests.cpu -> cpu)
-	switch {
-	case strings.Contains(string(res), "cpu"):
-		if v, ok := c.Thresholds[corev1.ResourceCPU]; ok {
-			return v
-		}
-	case strings.Contains(string(res), "memory"):
-		if v, ok := c.Thresholds[corev1.ResourceMemory]; ok {
-			return v
-		}
-	case strings.Contains(string(res), "storage"):
-		if v, ok := c.Thresholds[corev1.ResourceStorage]; ok {
-			return v
-		}
-	}
-
-	// Fallback to default
-	if v, ok := c.Thresholds[defaultKey]; ok {
-		return v
-	}
-	return 80.0
-}
-
-func (c ResizerConfig) GetIncrement(res corev1.ResourceName) float64 {
-	if v, ok := c.IncrementFactors[res]; ok {
-		return v
-	}
-	if strings.Contains(string(res), "cpu") {
-		if v, ok := c.IncrementFactors[corev1.ResourceCPU]; ok {
-			return v
-		}
-	}
-	if strings.Contains(string(res), "memory") {
-		if v, ok := c.IncrementFactors[corev1.ResourceMemory]; ok {
-			return v
-		}
-	}
-	if strings.Contains(string(res), "storage") {
-		if v, ok := c.IncrementFactors[corev1.ResourceStorage]; ok {
-			return v
-		}
-	}
-	if v, ok := c.IncrementFactors[defaultKey]; ok {
-		return v
-	}
-	return 0.2
-}
-
-func parseConfig(annotations map[string]string) ResizerConfig {
-	config := ResizerConfig{
-		Thresholds:       make(map[corev1.ResourceName]float64),
-		IncrementFactors: make(map[corev1.ResourceName]float64),
-		Cooldown:         60 * time.Minute,
-	}
-
-	// Set Defaults
-	config.Thresholds[defaultKey] = 80.0
-	config.IncrementFactors[defaultKey] = 0.2
-
-	// Helper to parse percentage
-	parsePercent := func(val string) (float64, bool) {
-		clean := strings.TrimSuffix(val, "%")
-		v, err := strconv.ParseFloat(clean, 64)
-		if err != nil {
-			return 0, false
-		}
-		if strings.HasSuffix(val, "%") {
-			return v / 100.0, true
-		}
-		return v, true // Assume raw float (0.2) or int (80) depending on context?
-		// For threshold we expect 80. For increment we expect 0.2 or 20%.
-		// Let's handle them separately in the loop if needed, or just be smart.
-	}
-
-	for k, v := range annotations {
-		if !strings.HasPrefix(k, "resizer.io/") {
-			continue
-		}
-		key := strings.TrimPrefix(k, "resizer.io/")
-
-		// Thresholds
-		if strings.HasSuffix(key, "-threshold") {
-			// e.g. "threshold", "cpu-threshold", "requests.memory-threshold"
-			res := strings.TrimSuffix(key, "-threshold")
-			if res == "" {
-				res = defaultKey
-			}
-
-			if val, err := strconv.ParseFloat(v, 64); err == nil {
-				config.Thresholds[corev1.ResourceName(res)] = val
-			}
-		}
-
-		// Increments
-		if strings.HasSuffix(key, "-increment") {
-			res := strings.TrimSuffix(key, "-increment")
-			if res == "" {
-				res = defaultKey
-			}
-
-			if val, ok := parsePercent(v); ok {
-				// If user wrote "20", parsePercent returns 20. But for increment we want 0.2?
-				// Or maybe we standardize on "0.2" or "20%".
-				// If > 1, assume percentage? No, 2.0 means 200%.
-				// Let's stick to: if "%" suffix -> /100. If no suffix -> raw value.
-				// But for threshold "80" means 80%.
-				// Increment: "0.2" = 20%. "20%" = 20%.
-				config.IncrementFactors[corev1.ResourceName(res)] = val
-			}
-		}
-
-		// Cooldown
-		if key == "cooldown-minutes" {
-			if val, err := strconv.Atoi(v); err == nil {
-				config.Cooldown = time.Duration(val) * time.Minute
-			}
-		}
-	}
-
-	return config
-}
-
-func parseEventMessage(message string) (corev1.ResourceName, resource.Quantity, error) {
-	// Parse message: "exceeded quota: my-quota, requested: cpu=1, used: cpu=10, limited: cpu=10"
-	parts := strings.Split(message, ",")
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if strings.HasPrefix(part, "requested: ") {
-			// "requested: cpu=500m"
-			reqPart := strings.TrimPrefix(part, "requested: ")
-			// "cpu=500m"
-			kv := strings.Split(reqPart, "=")
-			if len(kv) == 2 {
-				resName := corev1.ResourceName(kv[0])
-				reqQty, err := resource.ParseQuantity(kv[1])
-				if err == nil {
-					return resName, reqQty, nil
-				}
-			}
-		}
-	}
-	return "", resource.Quantity{}, fmt.Errorf("failed to parse message")
-}
-
-func getWorkloadKey(name string) string {
-	// Heuristic: Strip the last segment (after the last hyphen) to identify the workload.
-	// e.g. "app-a-6b474476c4-xfg2z" -> "app-a-6b474476c4" (ReplicaSet name)
-	// e.g. "app-b-deployment-12345" -> "app-b-deployment"
-	// e.g. "web-0" -> "web" (StatefulSet)
-	lastHyphen := strings.LastIndex(name, "-")
-	if lastHyphen == -1 {
-		return name
-	}
-	return name[:lastHyphen]
-}
-
-func convertToReadableFormat(resName corev1.ResourceName, milliValue int64, format resource.Format) resource.Quantity {
-	if strings.Contains(string(resName), "memory") || strings.Contains(string(resName), "storage") {
-		// Memory/Storage Fix: Convert from Milli-Bytes back to Bytes
-		// 1000 Millis = 1 Byte
-		bytesValue := float64(milliValue) / 1000.0
-
-		// Round up to the nearest Mebibyte (Mi) to ensure readable output (e.g. "123Mi" instead of raw bytes)
-		// Kubernetes resource.Quantity prefers multiples of 1024 for BinarySI to display friendly units.
-		const bytesPerMi = 1024 * 1024
-		miValue := math.Ceil(bytesValue / float64(bytesPerMi))
-		newBytesValue := int64(miValue * float64(bytesPerMi))
-
-		return *resource.NewQuantity(newBytesValue, resource.BinarySI)
-	}
-	return *resource.NewMilliQuantity(milliValue, format)
-}
 
 func (r *ResourceQuotaReconciler) mapEventToQuota(ctx context.Context, obj client.Object) []reconcile.Request {
 	evt, ok := obj.(*corev1.Event)
@@ -298,7 +109,7 @@ func (r *ResourceQuotaReconciler) mapEventToQuota(ctx context.Context, obj clien
 }
 
 func (r *ResourceQuotaReconciler) calculateWorkloadDeficit(ctx context.Context, evt corev1.Event, failedRes corev1.ResourceName, failedQty resource.Quantity) (string, map[corev1.ResourceName]int64) {
-	key := getWorkloadKey(evt.InvolvedObject.Name)
+	key := sizing.WorkloadKey(evt.InvolvedObject.Name)
 	logger := log.FromContext(ctx)
 
 	// Default: just the failed resource from the event
@@ -314,11 +125,11 @@ func (r *ResourceQuotaReconciler) calculateWorkloadDeficit(ctx context.Context, 
 
 		// 1. Calculate Pod Resources (CPU, Memory)
 		// Effective Request = Max(Max(Init), Sum(Containers))
-		reqs := getPodRequests(podSpec)
+		reqs := sizing.PodRequests(podSpec)
 
 		// 2. Calculate Storage Resources (if PVC templates exist)
 		if len(pvcTemplates) > 0 {
-			pvcReqs := getPVCRequests(pvcTemplates)
+			pvcReqs := sizing.PVCRequests(pvcTemplates)
 			for k, v := range pvcReqs {
 				reqs[k] += v
 			}
@@ -398,111 +209,6 @@ func (r *ResourceQuotaReconciler) calculateWorkloadDeficit(ctx context.Context, 
 	}
 
 	return key, deficits
-}
-
-func getPodRequests(spec corev1.PodSpec) map[corev1.ResourceName]int64 {
-	reqs := make(map[corev1.ResourceName]int64)
-
-	// Helper to add resources with proper mapping
-	addResources := func(list corev1.ResourceList, isLimit bool) {
-		for name, qty := range list {
-			key := name
-			if isLimit {
-				switch name {
-				case corev1.ResourceCPU:
-					key = corev1.ResourceLimitsCPU
-				case corev1.ResourceMemory:
-					key = corev1.ResourceLimitsMemory
-				}
-			} else {
-				switch name {
-				case corev1.ResourceCPU:
-					key = corev1.ResourceRequestsCPU
-				case corev1.ResourceMemory:
-					key = corev1.ResourceRequestsMemory
-				case corev1.ResourceStorage:
-					key = corev1.ResourceRequestsStorage
-				}
-			}
-			reqs[key] += qty.MilliValue()
-		}
-	}
-
-	// 1. Sum of App Containers
-	for _, c := range spec.Containers {
-		addResources(c.Resources.Requests, false)
-		addResources(c.Resources.Limits, true)
-	}
-
-	// 2. Max of Init Containers (Effective Request logic)
-	// Note: For limits, the logic is similar (max of init vs sum of app).
-	// However, K8s resource formula is complex.
-	// For simplicity/safety in Quota resizing, taking the MAX of Init Containers
-	// and adding it to the App Containers (if Init is larger) is a safe upper bound.
-	// But strictly speaking: Effective = max( max(init), sum(app) )
-	// Our current logic was: sum(app) + max(init - sum(app), 0) ?
-	// No, the previous logic was:
-	// reqs[name] += qty (for app)
-	// if val > reqs[name] { reqs[name] = val } (for init)
-	// This implements max(sum(app), max(init)). Correct.
-
-	// We need to do this per-resource-key.
-	// Since we now map keys, we can just iterate and compare.
-	for _, c := range spec.InitContainers {
-		// We need a temporary map for this init container to handle the mapping
-		initReqs := make(map[corev1.ResourceName]int64)
-
-		// Helper for single container
-		addInit := func(list corev1.ResourceList, isLimit bool) {
-			for name, qty := range list {
-				key := name
-				if isLimit {
-					switch name {
-					case corev1.ResourceCPU:
-						key = corev1.ResourceLimitsCPU
-					case corev1.ResourceMemory:
-						key = corev1.ResourceLimitsMemory
-					}
-				} else {
-					switch name {
-					case corev1.ResourceCPU:
-						key = corev1.ResourceRequestsCPU
-					case corev1.ResourceMemory:
-						key = corev1.ResourceRequestsMemory
-					case corev1.ResourceStorage:
-						key = corev1.ResourceRequestsStorage
-					}
-				}
-				initReqs[key] = qty.MilliValue()
-			}
-		}
-
-		addInit(c.Resources.Requests, false)
-		addInit(c.Resources.Limits, true)
-
-		// Compare with current total
-		for k, v := range initReqs {
-			if v > reqs[k] {
-				reqs[k] = v
-			}
-		}
-	}
-	return reqs
-}
-
-func getPVCRequests(templates []corev1.PersistentVolumeClaim) map[corev1.ResourceName]int64 {
-	reqs := make(map[corev1.ResourceName]int64)
-	for _, pvc := range templates {
-		// Requests
-		for name, qty := range pvc.Spec.Resources.Requests {
-			key := name
-			if name == corev1.ResourceStorage {
-				key = corev1.ResourceRequestsStorage
-			}
-			reqs[key] += qty.MilliValue()
-		}
-	}
-	return reqs
 }
 
 func (r *ResourceQuotaReconciler) isObjectAlive(ctx context.Context, ref corev1.ObjectReference, namespace string) bool {

@@ -3,16 +3,20 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 	"github.com/payback159/namespace-resizer/internal/config"
 	"github.com/payback159/namespace-resizer/internal/git"
 	"github.com/payback159/namespace-resizer/internal/lock"
+	"github.com/payback159/namespace-resizer/internal/sizing"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -57,7 +61,10 @@ func TestAutoMerge(t *testing.T) {
 		// Ensure the lock is held by PR 123 at the start of each case. A
 		// successful auto-merge now releases the lock immediately, so resetting
 		// here keeps the sub-tests independent of execution order.
-		_ = locker.ReleaseLock(context.TODO(), nsName, quotaName)
+		_ = locker.MutateState(context.TODO(), nsName, quotaName, func(s *lock.State) {
+			s.PRID = 0
+			s.PRDirection = ""
+		})
 		g.Expect(locker.AcquireLock(context.TODO(), nsName, quotaName, 123)).To(Succeed())
 
 		// Update Namespace Annotation
@@ -80,6 +87,8 @@ func TestAutoMerge(t *testing.T) {
 			Scheme:          scheme,
 			GitProvider:     fakeGit,
 			Locker:          locker,
+			Observer:        NewObserver(locker, time.Now),
+			BasePolicy:      sizing.DefaultPolicy(),
 			EnableAutoMerge: enableGlobal,
 		}
 
@@ -137,4 +146,59 @@ func TestAutoMerge(t *testing.T) {
 		fakeGit := runReconcile(true, "", &git.PRStatus{IsOpen: true, Mergeable: true, MergeableState: "blocked", ChecksState: "pending", ChecksTotalCount: 0})
 		g.Expect(fakeGit.MergedPRID).To(Equal(123))
 	})
+}
+
+func TestAutoMerge_NeverMergesAShrink(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = coordinationv1.AddToScheme(scheme)
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a"}}
+	quota := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "compute", Namespace: "team-a", UID: types.UID("uid-1"),
+		},
+		Status: corev1.ResourceQuotaStatus{
+			Hard: corev1.ResourceList{
+				corev1.ResourceRequestsCPU: resource.MustParse("16"),
+			},
+			Used: corev1.ResourceList{
+				corev1.ResourceRequestsCPU: resource.MustParse("4"),
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ns, quota).Build()
+	locker := lock.NewLeaseLocker(c)
+
+	g.Expect(locker.MutateState(ctx, "team-a", "compute", func(s *lock.State) {
+		s.PRID = 42
+		s.PRDirection = git.DirectionShrink
+	})).To(Succeed())
+
+	provider := &FakeGitProvider{PRStatus: &git.PRStatus{
+		IsOpen:         true,
+		Mergeable:      true,
+		MergeableState: git.MergeableStateClean,
+		ChecksState:    git.ChecksStateSuccess,
+	}}
+
+	reconciler := &ResourceQuotaReconciler{
+		Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(10),
+		GitProvider: provider, Locker: locker,
+		Observer:        NewObserver(locker, time.Now),
+		BasePolicy:      sizing.DefaultPolicy(),
+		EnableAutoMerge: true,
+	}
+
+	_, err := reconciler.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "compute", Namespace: "team-a"},
+	})
+
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(provider.MergedPRID).To(Equal(0),
+		"a shrink PR must never be auto-merged, however clean it looks")
 }

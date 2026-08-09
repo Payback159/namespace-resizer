@@ -16,7 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-func TestAnalyzeEvents_MultiBurst(t *testing.T) {
+func TestCollectDeficits_MultiBurst(t *testing.T) {
 	g := NewWithT(t)
 
 	// Setup Scheme
@@ -133,28 +133,15 @@ func TestAnalyzeEvents_MultiBurst(t *testing.T) {
 		Locker: lock.NewLeaseLocker(fakeClient),
 	}
 
-	// Config with 0 increment to make math easy
-	config := ResizerConfig{
-		Thresholds:       map[corev1.ResourceName]float64{"default": 80.0},
-		IncrementFactors: map[corev1.ResourceName]float64{"default": 0.0}, // No buffer for this test
-		Cooldown:         time.Minute,
-	}
-
 	// 3. Run Analysis
-	recs, err := r.analyzeEvents(context.TODO(), quota, config)
+	deficits, err := r.collectDeficits(context.TODO(), quota, time.Time{})
 	g.Expect(err).ToNot(HaveOccurred())
 
 	// 4. Verify
 	// Logic:
-	// UID 1 Deficit: 2 (Max of 2 and 2)
+	// UID 1 Deficit: 2 (Max of 2 and 2, retries do not accumulate)
 	// UID 2 Deficit: 3
-	// Total Deficit: 5
-	// Base Need: Used (10) + Total Deficit (5) = 15
-
-	cpuRec, ok := recs[corev1.ResourceCPU]
-	g.Expect(ok).To(BeTrue(), "Should have a CPU recommendation")
-
-	// Check value
-	// 15
-	g.Expect(cpuRec.Value()).To(Equal(int64(15)), "Should recommend 15 CPU (10 used + 2 for A + 3 for B)")
+	// Total raw deficit: 5 CPU (2000m + 3000m)
+	g.Expect(deficits).To(HaveKey(corev1.ResourceCPU))
+	g.Expect(deficits[corev1.ResourceCPU]).To(Equal(int64(5000)), "Should sum 2 CPU for A and 3 CPU for B")
 }

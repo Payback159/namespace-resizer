@@ -59,6 +59,9 @@ spec:
           args:
             - --leader-elect
             - --health-probe-bind-address=:8081
+            # Uncomment once the dry-run metrics look right. See
+            # docs/OPERATIONS.md for what to check first.
+            # - --enable-shrink
           image: controller:latest
           name: manager
           ports: []

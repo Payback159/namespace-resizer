@@ -9,16 +9,17 @@ Managing ResourceQuotas in Kubernetes is often a manual and reactive process. Te
 The Namespace Resizer solves this by:
 1.  **Monitoring Usage:** Continuously checks `used / hard` ratio of ResourceQuotas.
 2.  **Detecting Bursts:** Listens for `FailedCreate` events caused by quota limits (e.g., during rolling updates or scaling).
-3.  **Calculating Recommendations:** Proposes new limits based on configurable thresholds and increment factors.
+3.  **Calculating Recommendations:** Proposes new limits from observed demand plus a configurable headroom, growing or shrinking depending on which side of a tolerance band the current limit falls on.
 4.  **GitOps Integration:** Creates Pull Requests (GitHub) with the recommended changes, allowing for review and audit trails.
 5.  **Safety First:** Includes "Cooldown" periods and "Locking" mechanisms to prevent flapping and race conditions.
 
 ## Features
 
-*   **Metric-based Resizing:** Increases quota when usage > X% (default 80%).
+*   **Bidirectional Metric-based Resizing:** Follows observed demand in both directions — grows a quota that runs short and proposes a reviewable, step-capped shrink for one that has been oversized for a full observation window (see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).
 *   **Event-based Resizing:** Reacts immediately to denied pods due to quota.
 *   **Generic Resource Support:** Works for CPU, Memory, Storage, and custom resources.
 *   **Configurable:** Fine-tune thresholds and increments via Namespace Annotations.
+*   **Safe Dry-Run Rollout:** Shrinking ships disabled by default; the controller computes and exports every shrink decision as a metric first, so its effect is observable before a single shrink pull request is opened (see [docs/OPERATIONS.md](docs/OPERATIONS.md)).
 *   **GitOps Workflow:** Automates the "Request" part of Quota management.
 
 ## Configuration

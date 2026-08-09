@@ -1,0 +1,527 @@
+package sizing
+
+import (
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+)
+
+var testNow = time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+
+// baseInput builds an Input whose window is fully covered at the given peak,
+// so every shrink gate passes unless a test deliberately breaks one.
+func baseInput(hard, usedNow, peak string) Input {
+	policy := DefaultPolicy()
+	return Input{
+		Now: testNow,
+		Hard: corev1.ResourceList{
+			corev1.ResourceRequestsCPU: resource.MustParse(hard),
+		},
+		Used: corev1.ResourceList{
+			corev1.ResourceRequestsCPU: resource.MustParse(usedNow),
+		},
+		Window: fillWindow(testNow, policy.WindowDays, peak),
+		Policy: policy,
+	}
+}
+
+func targetCPU(t *testing.T, d Decision) string {
+	t.Helper()
+	qty, ok := d.Targets[corev1.ResourceRequestsCPU]
+	if !ok {
+		t.Fatalf("no target for requests.cpu, decision = %+v", d)
+	}
+	return qty.String()
+}
+
+func TestDecide_GrowOnDeficit(t *testing.T) {
+	in := baseInput("10", "10", "10")
+	in.Deficits = map[corev1.ResourceName]int64{
+		corev1.ResourceRequestsCPU: 6000,
+	}
+
+	got := Decide(in)
+
+	if got.Direction != DirectionGrow {
+		t.Fatalf("direction = %v, want grow", got.Direction)
+	}
+	// peak = used + deficit = 16, target = 16 * 1.25 = 20
+	if want := "20"; targetCPU(t, got) != want {
+		t.Fatalf("target = %s, want %s", targetCPU(t, got), want)
+	}
+}
+
+func TestDecide_ShrinkIsStepCapped(t *testing.T) {
+	// hard 16, peak 4, used 3.5 -> target 5, but the 25% cap allows only 12.
+	in := baseInput("16", "3500m", "4")
+
+	got := Decide(in)
+
+	if got.Direction != DirectionShrink {
+		t.Fatalf("direction = %v, want shrink (blocked by %v)", got.Direction, got.BlockedBy)
+	}
+	if want := "12"; targetCPU(t, got) != want {
+		t.Fatalf("target = %s, want %s", targetCPU(t, got), want)
+	}
+}
+
+func TestDecide_ToleranceBandIsQuiet(t *testing.T) {
+	// used = peak = 4, target = 5. The band is hard in [4.35 .. 5.88].
+	for _, hard := range []string{"4500m", "5", "5800m"} {
+		t.Run("hard="+hard, func(t *testing.T) {
+			got := Decide(baseInput(hard, "4", "4"))
+			if got.Direction != DirectionNone {
+				t.Fatalf("direction = %v, want none for hard=%s", got.Direction, hard)
+			}
+		})
+	}
+}
+
+func TestDecide_HardFloorFromCurrentUsage(t *testing.T) {
+	// The window says 1 CPU, but 8 CPU are in use right now. The floor wins.
+	in := baseInput("16", "8", "1")
+
+	got := Decide(in)
+
+	if got.Direction != DirectionShrink {
+		t.Fatalf("direction = %v, want shrink", got.Direction)
+	}
+	// floor = 8 * 1.25 = 10, which is above the step cap of 12? No: the cap
+	// allows 12 and the floor allows 10, so the higher of the two wins.
+	if want := "12"; targetCPU(t, got) != want {
+		t.Fatalf("target = %s, want %s", targetCPU(t, got), want)
+	}
+}
+
+func TestDecide_MinAnnotationIsRespected(t *testing.T) {
+	// Demand alone would justify shrinking all the way to the step cap of 12.
+	// The configured minimum of 13 stops it one notch short, and 13 is still
+	// below the shrink threshold of 16 * 0.85 = 13.6, so a shrink happens.
+	in := baseInput("16", "1", "1")
+	in.Policy.Min = map[corev1.ResourceName]resource.Quantity{
+		corev1.ResourceRequestsCPU: resource.MustParse("13"),
+	}
+
+	got := Decide(in)
+
+	if got.Direction != DirectionShrink {
+		t.Fatalf("direction = %v, want shrink", got.Direction)
+	}
+	if want := "13"; targetCPU(t, got) != want {
+		t.Fatalf("target = %s, want %s (min annotation, not the step cap of 12)",
+			targetCPU(t, got), want)
+	}
+}
+
+func TestDecide_MinAnnotationCanCloseTheBand(t *testing.T) {
+	// A minimum of 14 lifts the target into the tolerance band around the
+	// current limit of 16 (13.6 .. 18.4). The minimum raises the target; it
+	// does not authorise a change that the band forbids.
+	in := baseInput("16", "1", "1")
+	in.Policy.Min = map[corev1.ResourceName]resource.Quantity{
+		corev1.ResourceRequestsCPU: resource.MustParse("14"),
+	}
+
+	got := Decide(in)
+
+	if got.Direction != DirectionNone {
+		t.Fatalf("direction = %v, want none — target 14 sits inside the band",
+			got.Direction)
+	}
+}
+
+func TestDecide_GrowBeatsShrink(t *testing.T) {
+	policy := DefaultPolicy()
+	in := Input{
+		Now: testNow,
+		Hard: corev1.ResourceList{
+			corev1.ResourceRequestsCPU:    resource.MustParse("4"),
+			corev1.ResourceRequestsMemory: resource.MustParse("64Gi"),
+		},
+		Used: corev1.ResourceList{
+			corev1.ResourceRequestsCPU:    resource.MustParse("4"),
+			corev1.ResourceRequestsMemory: resource.MustParse("1Gi"),
+		},
+		Window: fillWindow(testNow, policy.WindowDays, "4"),
+		Policy: policy,
+	}
+
+	got := Decide(in)
+
+	if got.Direction != DirectionGrow {
+		t.Fatalf("direction = %v, want grow", got.Direction)
+	}
+	if _, ok := got.Targets[corev1.ResourceRequestsMemory]; ok {
+		t.Fatal("memory shrink target leaked into a grow decision")
+	}
+}
+
+func TestDecide_ShrinkGates(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*Input)
+		wantBad Gate
+	}{
+		{
+			name:    "shrink disabled",
+			mutate:  func(in *Input) { in.Policy.ShrinkEnabled = false },
+			wantBad: GateEnabled,
+		},
+		{
+			name:    "window incomplete",
+			mutate:  func(in *Input) { in.Window = fillWindow(testNow, 3, "4") },
+			wantBad: GateWindow,
+		},
+		{
+			name:    "grow inside the window",
+			mutate:  func(in *Input) { in.LastGrow = testNow.Add(-48 * time.Hour) },
+			wantBad: GateRecentGrow,
+		},
+		{
+			name:    "shrink cooldown running",
+			mutate:  func(in *Input) { in.LastShrink = testNow.Add(-24 * time.Hour) },
+			wantBad: GateCooldown,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := baseInput("16", "3500m", "4")
+			tc.mutate(&in)
+
+			got := Decide(in)
+
+			if got.Direction != DirectionNone {
+				t.Fatalf("direction = %v, want none", got.Direction)
+			}
+			found := false
+			for _, gate := range got.BlockedBy {
+				if gate == tc.wantBad {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("BlockedBy = %v, want it to contain %q", got.BlockedBy, tc.wantBad)
+			}
+		})
+	}
+}
+
+func TestDecide_BlockedShrinkStillReportsAPreview(t *testing.T) {
+	in := baseInput("16", "3500m", "4")
+	in.Policy.ShrinkEnabled = false
+
+	got := Decide(in)
+
+	if got.Direction != DirectionNone {
+		t.Fatalf("direction = %v, want none", got.Direction)
+	}
+	if len(got.Targets) != 0 {
+		t.Fatalf("Targets = %v, want empty when a gate blocks", got.Targets)
+	}
+	qty, ok := got.ShrinkPreview[corev1.ResourceRequestsCPU]
+	if !ok {
+		t.Fatal("ShrinkPreview is empty, want the would-be target for dry-run metrics")
+	}
+	if qty.String() != "12" {
+		t.Fatalf("preview = %s, want 12", qty.String())
+	}
+}
+
+func TestDecide_GatesDoNotBlockGrow(t *testing.T) {
+	in := baseInput("10", "10", "10")
+	in.Deficits = map[corev1.ResourceName]int64{corev1.ResourceRequestsCPU: 6000}
+	in.Policy.ShrinkEnabled = false
+	in.LastShrink = testNow.Add(-1 * time.Hour)
+	in.Window = Window{Version: WindowVersion}
+
+	got := Decide(in)
+
+	if got.Direction != DirectionGrow {
+		t.Fatalf("direction = %v, want grow regardless of shrink gates", got.Direction)
+	}
+}
+
+func TestDecide_DisabledNamespaceDoesNothing(t *testing.T) {
+	in := baseInput("16", "3500m", "4")
+	in.Policy.Enabled = false
+
+	if got := Decide(in); got.Direction != DirectionNone {
+		t.Fatalf("direction = %v, want none for a disabled namespace", got.Direction)
+	}
+}
+
+func TestDecide_ZeroHardIsSkipped(t *testing.T) {
+	in := baseInput("0", "0", "4")
+
+	if got := Decide(in); got.Direction != DirectionNone {
+		t.Fatalf("direction = %v, want none when hard is zero", got.Direction)
+	}
+}
+
+func TestDecide_OverflowingHardIsSkipped(t *testing.T) {
+	// Quantity.MilliValue() wraps instead of clamping above roughly 8 PiB
+	// (verified empirically against the pinned k8s.io/apimachinery v0.36.1:
+	// 16Pi.Value()=18014398509481984, MilliValue()=-432345564227567616). A
+	// resource whose hard limit sits above that threshold must be skipped
+	// rather than have the grow/shrink branches act on a wrapped, possibly
+	// negative, milli value.
+	for _, hard := range []string{"9Pi", "16Pi", "100Pi"} {
+		t.Run(hard, func(t *testing.T) {
+			in := baseInput(hard, "1Pi", "1Pi")
+
+			got := Decide(in)
+
+			if got.Direction != DirectionNone {
+				t.Fatalf("direction = %v, want none for hard=%s (MilliValue overflow)",
+					got.Direction, hard)
+			}
+			if len(got.Targets) != 0 {
+				t.Fatalf("Targets = %v, want empty", got.Targets)
+			}
+			if len(got.RawTargets) != 0 {
+				t.Fatalf("RawTargets = %v, want empty for an unmeasurable resource", got.RawTargets)
+			}
+		})
+	}
+}
+
+func TestDecide_OverflowingUsedIsSkipped(t *testing.T) {
+	// The same wrap applies to Used: a hard limit well inside int64-milli
+	// range must not be acted on using a wrapped "used" value either.
+	in := baseInput("10", "16Pi", "4")
+
+	got := Decide(in)
+
+	if got.Direction != DirectionNone {
+		t.Fatalf("direction = %v, want none for an overflowing used value", got.Direction)
+	}
+	if len(got.Targets) != 0 {
+		t.Fatalf("Targets = %v, want empty", got.Targets)
+	}
+}
+
+// TestDecide_ExtremeUsedValuesAreRejected drives Decide with each of the
+// residue-class examples overflowsMilliValue's doc comment cites: values so
+// large that Quantity.Value() does not clamp or saturate to zero, it
+// returns the low 64 bits of the true value (verified empirically against
+// the pinned k8s.io/apimachinery v0.36.1). Zero is only one of those
+// residues -- 1E30 happens to land on it -- and a guard that only checked
+// for zero let the other three straight through, including one (2^64-1)
+// that reads back negative and would have gone straight into RawTargets.
+func TestDecide_ExtremeUsedValuesAreRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		used string
+	}{
+		{"1E30, Value()=0", "1E30"},
+		{"2^64+1, Value()=1", "18446744073709551617"},
+		{"2^64-1, Value()=-1", "18446744073709551615"},
+		{"2^63, Value()=-9223372036854775808", "9223372036854775808"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := baseInput("10", tc.used, "4")
+
+			got := Decide(in)
+
+			if got.Direction != DirectionNone {
+				t.Fatalf("direction = %v, want none for used=%s", got.Direction, tc.used)
+			}
+			if len(got.Targets) != 0 {
+				t.Fatalf("Targets = %v, want empty", got.Targets)
+			}
+			if _, ok := got.RawTargets[corev1.ResourceRequestsCPU]; ok {
+				t.Fatalf("RawTargets = %v, want no entry for an unmeasurable resource", got.RawTargets)
+			}
+		})
+	}
+}
+
+// TestDecide_ExtremeHardIsSkipped mirrors the used-side cases for hard, and
+// has to work harder than they do to stay meaningful — two other guards will
+// absorb a wrapped hard limit for reasons that have nothing to do with this
+// one, and a case they absorb proves nothing.
+//
+// 2^64+1 reads back as Value()=1, so it clears the hardMilli==0 guard, which
+// rules out 1E30. That leaves the quantisation guard: it compares the
+// proposed quantity against the *real* hard Quantity, and against a genuine
+// 1.8e19 every grow target loses, so any grow case is discarded before the
+// assertion can see it. A shrink is the one direction that survives — the
+// proposal is smaller than the wrapped limit and smaller than the real one —
+// so used has to be low enough to make the wrapped limit look oversized.
+// With hard reading as 1 milli-CPU, used=0.1 puts the target at 125 milli,
+// under the 850-milli shrink threshold, and the step cap lands it at 0.75.
+// Remove overflowsMilliValue and this proposes shrinking a 1.8e19 quota to
+// 750m.
+func TestDecide_ExtremeHardIsSkipped(t *testing.T) {
+	in := baseInput("18446744073709551617", "0.1", "0.1")
+
+	got := Decide(in)
+
+	if got.Direction != DirectionNone {
+		t.Fatalf("direction = %v, want none for an unmeasurable hard value", got.Direction)
+	}
+	if len(got.Targets) != 0 {
+		t.Fatalf("Targets = %v, want empty", got.Targets)
+	}
+}
+
+// TestDecide_ZeroUsedIsProcessedNormally guards the other half of
+// overflowsMilliValue: a genuinely zero used value (Sign()==0, IsZero()==
+// true) is not the thing this guard exists to reject and must still reach
+// the ordinary target formula, not be treated as unmeasurable.
+func TestDecide_ZeroUsedIsProcessedNormally(t *testing.T) {
+	in := baseInput("10", "0", "0")
+
+	got := Decide(in)
+
+	// used=0, peak=0, headroom 0.25 -> target 0, well below the tolerance
+	// band around hard=10: a real shrink candidate, not a skip.
+	if got.Direction != DirectionShrink {
+		t.Fatalf("direction = %v, want shrink for a genuinely idle resource", got.Direction)
+	}
+	if _, ok := got.RawTargets[corev1.ResourceRequestsCPU]; !ok {
+		t.Fatalf("RawTargets = %v, want an entry for a genuinely zero used value", got.RawTargets)
+	}
+}
+
+func TestDecide_GrowQuantizationGuardDoesNotSuppressARealIncrease(t *testing.T) {
+	// Quantize always rounds up, so a target that already cleared the grow
+	// threshold before quantization cannot round back down to hard or below
+	// — but the guard at decide.go's grow branch exists to catch exactly
+	// that if it ever did. Pin the boundary case closest to it: a target one
+	// milli-unit above the grow threshold still produces a strictly larger
+	// quantized value.
+	in := baseInput("10", "10", "10")
+	in.Deficits = map[corev1.ResourceName]int64{
+		corev1.ResourceRequestsCPU: 6000,
+	}
+
+	got := Decide(in)
+
+	if got.Direction != DirectionGrow {
+		t.Fatalf("direction = %v, want grow", got.Direction)
+	}
+	qty, ok := got.Targets[corev1.ResourceRequestsCPU]
+	if !ok {
+		t.Fatal("no grow target for requests.cpu")
+	}
+	hard := resource.MustParse("10")
+	if qty.Cmp(hard) <= 0 {
+		t.Fatalf("target %s did not clear hard %s", qty.String(), hard.String())
+	}
+}
+
+func TestDecide_ShrinkQuantizationGuardCatchesRoundingThatErasesTheDecrease(t *testing.T) {
+	// hard = 6Mi. A configured minimum of ~5.05Mi (5,300,000 bytes) is below
+	// the shrink threshold (0.85 * 6Mi ~= 5.1Mi) but Quantize's ceil-to-Mi
+	// rounding brings it straight back up to a whole 6Mi — hard itself. The
+	// qty.Cmp(hard) >= 0 guard must catch this and propose nothing, rather
+	// than open a PR that "shrinks" a quota to its own current value.
+	//
+	// The window is fully covered for requests.memory specifically (not the
+	// CPU-keyed baseInput helper) so every shrink gate passes and the
+	// quantization guard is the only thing standing between this input and a
+	// shrink — a wide-open GateWindow would let this test pass for the wrong
+	// reason.
+	policy := DefaultPolicy()
+	policy.Min = map[corev1.ResourceName]resource.Quantity{
+		corev1.ResourceRequestsMemory: *resource.NewQuantity(5_300_000, resource.DecimalSI),
+	}
+
+	in := Input{
+		Now: testNow,
+		Hard: corev1.ResourceList{
+			corev1.ResourceRequestsMemory: *resource.NewQuantity(6*1024*1024, resource.BinarySI),
+		},
+		Used: corev1.ResourceList{
+			corev1.ResourceRequestsMemory: resource.MustParse("1Mi"),
+		},
+		Window: fullyCoveredWindow(testNow, policy.WindowDays, corev1.ResourceRequestsMemory, "1Mi"),
+		Policy: policy,
+	}
+
+	got := Decide(in)
+
+	if got.Direction != DirectionNone {
+		t.Fatalf("direction = %v, want none (rounding erased the decrease)", got.Direction)
+	}
+	if len(got.Targets) != 0 {
+		t.Fatalf("Targets = %v, want empty", got.Targets)
+	}
+}
+
+// fullyCoveredWindow samples every 5 minutes across the given number of
+// completed days ending yesterday for one resource, so the window is fully
+// covered for that resource specifically. Unlike fillWindow (which is fixed
+// to requests.cpu), this lets a test isolate a gate or a guard for a
+// different resource without the window itself becoming a confound.
+func fullyCoveredWindow(now time.Time, days int, res corev1.ResourceName, value string) Window {
+	w := Window{Version: WindowVersion}
+	start := now.UTC().AddDate(0, 0, -days).Truncate(24 * time.Hour)
+	list := corev1.ResourceList{res: resource.MustParse(value)}
+	for t := start; t.Before(now.UTC().Truncate(24 * time.Hour)); t = t.Add(5 * time.Minute) {
+		w.Observe(t, testUID, list, days)
+	}
+	return w
+}
+
+func TestDecide_MinAppliesViaAnnotationFamilyFallback(t *testing.T) {
+	// The docs give resizer.io/cpu-min as the example annotation, but the
+	// quota key Decide actually sees is requests.cpu. MinFor must resolve
+	// that through the family fallback the same way HeadroomFor does —
+	// seeding Policy.Min with the quota key directly (as the other min tests
+	// do) would hide exactly this gap.
+	policy, warnings := ParsePolicy(map[string]string{
+		"resizer.io/cpu-min": "13",
+	}, DefaultPolicy())
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %v, want none", warnings)
+	}
+
+	in := baseInput("16", "1", "1")
+	in.Policy = policy
+
+	got := Decide(in)
+
+	if got.Direction != DirectionShrink {
+		t.Fatalf("direction = %v, want shrink", got.Direction)
+	}
+	if want := "13"; targetCPU(t, got) != want {
+		t.Fatalf("target = %s, want %s (cpu-min via family fallback, not the step cap of 12)",
+			targetCPU(t, got), want)
+	}
+}
+
+func TestDecide_MissingUsedEntryIsSkipped(t *testing.T) {
+	// A Hard key with no corresponding Used entry must not be treated as
+	// fully idle (usedMilli = 0) — that would turn it into a bogus shrink
+	// candidate aiming at the configured minimum or zero. Kubernetes always
+	// populates Used for every Hard key in practice; this guards the case
+	// where it doesn't.
+	policy := DefaultPolicy()
+	in := Input{
+		Now: testNow,
+		Hard: corev1.ResourceList{
+			corev1.ResourceRequestsCPU: resource.MustParse("16"),
+		},
+		Used:   corev1.ResourceList{},
+		Window: fillWindow(testNow, policy.WindowDays, "4"),
+		Policy: policy,
+	}
+
+	got := Decide(in)
+
+	if got.Direction != DirectionNone {
+		t.Fatalf("direction = %v, want none when Used has no entry for the key", got.Direction)
+	}
+	if len(got.Targets) != 0 {
+		t.Fatalf("Targets = %v, want empty", got.Targets)
+	}
+	if len(got.BlockedBy) != 0 {
+		t.Fatalf("BlockedBy = %v, want empty — the key should be skipped, not gated", got.BlockedBy)
+	}
+}

@@ -1,0 +1,104 @@
+package controller
+
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/payback159/namespace-resizer/internal/sizing"
+)
+
+const (
+	labelNamespace = "namespace"
+	labelQuota     = "quota"
+	labelResource  = "resource"
+	labelGate      = "gate"
+	labelDirection = "direction"
+)
+
+var quotaLabels = []string{labelNamespace, labelQuota, labelResource}
+
+var (
+	quotaTarget = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "resizer_quota_target",
+		Help: "Computed target for a quota resource, in milli-units.",
+	}, quotaLabels)
+
+	quotaWasteRatio = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "resizer_quota_waste_ratio",
+		Help: "Current hard limit divided by the computed target.",
+	}, quotaLabels)
+
+	shrinkBlockedBy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "resizer_shrink_blocked_by",
+		Help: "1 while the named gate blocks a pending shrink, 0 otherwise.",
+	}, []string{labelNamespace, labelQuota, labelGate})
+
+	decisionTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "resizer_decision_total",
+		Help: "Decisions taken, by direction.",
+	}, []string{labelNamespace, labelQuota, labelDirection})
+)
+
+// allGates is iterated on every record so a gate that stopped blocking is
+// actively reset to 0 instead of keeping its last value forever.
+var allGates = []sizing.Gate{
+	sizing.GateEnabled,
+	sizing.GateWindow,
+	sizing.GateRecentGrow,
+	sizing.GateCooldown,
+}
+
+func init() {
+	metrics.Registry.MustRegister(
+		quotaTarget, quotaWasteRatio, shrinkBlockedBy, decisionTotal)
+}
+
+// recordDecision publishes one evaluation. quotaTarget and quotaWasteRatio
+// are built on decision.RawTargets — the uncapped target from spec 3, not
+// Targets/ShrinkPreview — so a namespace stays rankable by waste across its
+// full range instead of saturating at the per-PR step cap. Published for
+// every resource Decide evaluated, including one sitting inside the
+// tolerance band, so "waste ratio near 1" is observable as documented rather
+// than only ever appearing right at the grow/shrink trigger points.
+func recordDecision(
+	namespace, quota string,
+	hard corev1.ResourceList,
+	decision sizing.Decision,
+) {
+	decisionTotal.WithLabelValues(namespace, quota, decision.Direction.String()).Inc()
+
+	// Iterate the quota's own keys, not the targets, so a resource that no
+	// longer has one — dropped from the quota, no matching Used entry, or
+	// unmeasurable (see sizing.Decide's overflow guard) — has its series
+	// removed instead of left behind. A gauge frozen at its last value would
+	// keep reporting waste that has already been resolved — the mirror image
+	// of the stale gate this function is careful to avoid below.
+	for res, current := range hard {
+		labels := []string{namespace, quota, string(res)}
+
+		target, wanted := decision.RawTargets[res]
+		targetMilli := target.MilliValue()
+		if !wanted || targetMilli == 0 {
+			quotaTarget.DeleteLabelValues(labels...)
+			quotaWasteRatio.DeleteLabelValues(labels...)
+			continue
+		}
+
+		quotaTarget.WithLabelValues(labels...).Set(float64(targetMilli))
+		quotaWasteRatio.WithLabelValues(labels...).
+			Set(float64(current.MilliValue()) / float64(targetMilli))
+	}
+
+	blocked := make(map[sizing.Gate]bool, len(decision.BlockedBy))
+	for _, gate := range decision.BlockedBy {
+		blocked[gate] = true
+	}
+	for _, gate := range allGates {
+		value := 0.0
+		if blocked[gate] {
+			value = 1.0
+		}
+		shrinkBlockedBy.WithLabelValues(namespace, quota, string(gate)).Set(value)
+	}
+}

@@ -20,12 +20,12 @@ func TestStatefulLogProvider_ConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			id, err := p.CreatePR(ctx, "quota", "ns", nil, nil)
+			id, err := p.CreatePR(ctx, "quota", "ns", DirectionGrow, nil, nil)
 			if err != nil {
 				return
 			}
 			_, _ = p.GetPRStatus(ctx, id)
-			_, _ = p.FindOpenPR(ctx, "ns", "quota")
+			_, _, _ = p.FindOpenPR(ctx, "ns", "quota")
 			_ = p.MergePR(ctx, id, "squash")
 			_, _ = p.GetPRStatus(ctx, id)
 		}()
@@ -33,7 +33,7 @@ func TestStatefulLogProvider_ConcurrentAccess(t *testing.T) {
 	wg.Wait()
 
 	// After merging, no open PR should remain for the ns/quota.
-	openID, err := p.FindOpenPR(ctx, "ns", "quota")
+	openID, _, err := p.FindOpenPR(ctx, "ns", "quota")
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(openID).To(Equal(0))
 }
