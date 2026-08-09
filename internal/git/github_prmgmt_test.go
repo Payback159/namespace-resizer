@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"text/template"
 
@@ -264,23 +265,36 @@ func TestClosePR_CommentsThenCloses(t *testing.T) {
 
 func TestFindOpenPR_UnknownDirectionReadsAsShrink(t *testing.T) {
 	cases := []struct {
-		name  string
-		label string
+		name   string
+		labels []string
 	}{
-		{"wrong case", "resizer/direction:Shrink"},
-		{"unrecognised value", "resizer/direction:banana"},
+		{"wrong case", []string{"resizer/direction:Shrink"}},
+		{"unrecognised value", []string{"resizer/direction:banana"}},
+		// Nothing stops a second direction label being pinned onto a pull
+		// request this controller opened. A grow label sitting in front of
+		// the real one must not decide the outcome by list order.
+		{"grow label added in front of a shrink", []string{
+			"resizer/direction:grow", "resizer/direction:shrink",
+		}},
+		{"grow label added after a shrink", []string{
+			"resizer/direction:shrink", "resizer/direction:grow",
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
+			names := make([]string, 0, len(tc.labels))
+			for _, label := range tc.labels {
+				names = append(names, fmt.Sprintf(`{"name": %q}`, label))
+			}
 			mux := http.NewServeMux()
 			mux.HandleFunc("/repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = fmt.Fprintf(w, `[{
 					"number": 42,
 					"head": {"ref": "resize/team-a-compute-1700000000"},
-					"labels": [{"name": %q}]
-				}]`, tc.label)
+					"labels": [%s]
+				}]`, strings.Join(names, ", "))
 			})
 			provider, teardown := newTestProvider(t, mux)
 			defer teardown()

@@ -413,17 +413,22 @@ func (g *GitHubProvider) FindOpenPR(ctx context.Context, namespace, quotaName st
 // wrote it. Reading it as shrink is the safe direction — shrink proposals are
 // never auto-merged, so the cost of being wrong is one human review, whereas
 // reading it as grow would cost an unreviewed merge of lowered limits.
+//
+// For the same reason every direction label is inspected rather than the first
+// one found. Nothing stops a second one being added next to the label this
+// controller wrote, and stopping at the first match would let a grow label
+// pinned onto a genuine shrink decide the outcome by list order alone.
 func directionFromLabels(labels []*github.Label) string {
 	for _, label := range labels {
 		name := label.GetName()
 		if !strings.HasPrefix(name, labelDirectionPrefix) {
 			continue
 		}
-		if strings.TrimPrefix(name, labelDirectionPrefix) == DirectionGrow {
-			return DirectionGrow
+		if strings.TrimPrefix(name, labelDirectionPrefix) != DirectionGrow {
+			return DirectionShrink
 		}
-		return DirectionShrink
 	}
+	// Either no direction label at all, or every one of them said grow.
 	return DirectionGrow
 }
 
