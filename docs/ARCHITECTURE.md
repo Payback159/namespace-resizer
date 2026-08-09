@@ -33,21 +33,50 @@ Sobald der Trigger ausgelöst wurde, muss der neue Wert berechnet werden. Hierbe
 
 **Berechnungs-Modell:**
 
-$$ \text{NewLimit} = \text{CurrentLimit} \times (1 + \text{IncrementFactor}) $$
+$$ \text{Target} = \max(\text{Peak}_{\text{Fenster}}, \text{Used}) \times (1 + \text{Headroom}) $$
 
-*Hinweis:* Es gibt kein absolutes `MaxAllowedLimit` für den Namespace, um das Wachstum über den gesamten Lebenszyklus zu ermöglichen. Stattdessen setzen wir auf Geschwindigkeitsbegrenzungen (siehe 2.4).
+Gehandelt wird nur außerhalb eines Toleranzbands um diesen Zielwert. Details,
+Guardrails und Rollout: [Design-Dokument](design/2026-08-08-quota-rightsizing.md).
+
+*Hinweis:* Es gibt kein festes `MaxAllowedLimit` pro Namespace — nicht, um
+unbegrenztes Wachstum zu erlauben, sondern weil der beobachtete Bedarf selbst
+die Obergrenze bildet. Das Limit folgt dem Bedarf in beide Richtungen.
 
 **Parameter:**
-1.  **Threshold**: Prozentwert (0-100), ab wann reagiert wird (Default: 80%).
-2.  **IncrementFactor**: Wie stark soll erhöht werden? (z.B. 0.2 für 20%).
+1.  **Headroom**: Puffer über dem beobachteten Bedarf (Default: 0.25, also 25 %).
+2.  **Tolerance**: Toleranzband um den Zielwert, das Flapping strukturell ausschließt (Default: 0.15, also 15 %).
+
+Die früheren Parameter `Threshold` und `IncrementFactor` (Abschnitt 2.1)
+funktionieren als Annotationen weiter und werden intern auf `Headroom`
+abgebildet — Details und die Migrationstabelle stehen in
+[INSTALLATION.md](INSTALLATION.md).
 
 ### 2.4. Sicherheits-Mechanismen (Guardrails)
 
-Um "unkontrolliertes Wachstum in kurzer Zeit" zu verhindern, wird folgende Bremse eingebaut:
+Für Wachstum gilt weiterhin ein Cooldown:
 
 1.  **Cooldown Period (Zeit-Sperre):**
-    Nach einer Anpassung (oder Empfehlung) darf für einen definierten Zeitraum (z.B. 1h oder 24h) keine weitere Erhöhung stattfinden.
-    *Parameter:* `cooldown_minutes`
+    Nach einer Anpassung (oder Empfehlung) darf für einen definierten Zeitraum (Default 60 Minuten) keine weitere Erhöhung stattfinden.
+    *Parameter:* `resizer.io/cooldown-minutes`
+
+Für den Rückbau (Shrink) reicht ein Cooldown allein nicht — er ist dort nur
+eines von mehreren Gates, die **alle** halten müssen, bevor ein Shrink-PR
+entsteht:
+
+| Gate | Bedingung |
+|---|---|
+| `enabled` | Shrink ist global aktiviert (`--enable-shrink`) und der Namespace hat sich nicht per `resizer.io/shrink-enabled: "false"` abgemeldet |
+| `window` | Das Beobachtungsfenster ist über die konfigurierte Fensterlänge (Default 14 Tage) pro Resource lückenlos abgedeckt |
+| `recent-grow` | Innerhalb des Fensters fand kein Grow statt |
+| `cooldown` | Der letzte Shrink liegt länger zurück als der Shrink-Cooldown (Default 7 Tage) |
+| `lock` (implizit) | Kein offener PR für dieses Quota — ergibt sich aus dem bestehenden Lease-Lock (siehe 3.3) |
+
+Welches Gate blockiert, wird als Prometheus-Metrik exportiert, nicht als PR
+(siehe [OPERATIONS.md](OPERATIONS.md)). Zwei weitere Schutzmechanismen sind
+direkt in die Zielformel eingebaut und brauchen kein eigenes Gate: ein harter
+Boden (das Ziel fällt nie unter den aktuellen Bedarf) und ein Schritt-Deckel
+(maximal 25 % Rückbau pro PR). Details:
+[Design-Dokument, Abschnitt 3.3](design/2026-08-08-quota-rightsizing.md#33-shrink-gates).
 
 ### 2.5. Konfiguration (Policy & Scope)
 
@@ -209,3 +238,36 @@ Der Controller prüft bei jedem Reconcile-Loop (wenn ein Lock/PR existiert) den 
 **Sicherheit:**
 *   Race Conditions (Merge vs. ArgoCD Sync) werden durch die Idempotenz des Controllers abgefangen. Nach dem Merge bleibt die Quota im Cluster kurzzeitig "zu niedrig", bis ArgoCD synct. Der Controller sieht zwar weiterhin den Bedarf, findet aber keinen offenen PR mehr (da gemerged). Er würde theoretisch einen neuen PR erstellen wollen, aber wir können prüfen, ob der letzte Merge erst vor kurzem war (Cooldown) oder ob der Head-Commit des Repos bereits die Änderung enthält.
 *   Alternativ: Der Controller wartet einfach. Wenn ArgoCD synct, verschwindet der "Threshold exceeded" Zustand.
+
+### 3.5. Richtung, Supersede und TTL
+
+Jeder vom Controller erzeugte PR trägt neben dem Richtungs-Feld auf dem
+State-Lease (`resizer.io/pr-direction`) ein GitHub-Label
+(`resizer/direction:grow` oder `resizer/direction:shrink`). Das Label macht
+die Orphan-Recovery (`FindOpenPR`) richtungsbewusst, ohne die sie einen
+verwaisten Shrink-PR als Grow adoptieren und potenziell auto-mergen könnte.
+
+Gelesen wird das Label bewusst fehlertolerant in eine Richtung: Trägt ein PR
+gar kein Richtungs-Label, gilt er als `grow` — das erhält das Verhalten von
+PRs, die vor Einführung des Labels entstanden sind. Trägt er ein Label, das
+nicht exakt `grow` lautet (unbekannter Wert, Tippfehler, mehrere
+Richtungs-Label gleichzeitig), gilt er als `shrink`. Labels sind für jeden mit
+Repo-Zugriff schreibbar; ein PR, der bereits ein Label trägt, aber nicht
+eindeutig `grow` ist, kostet im schlimmsten Fall eine zusätzliche
+Review-Runde — die Alternative wäre ein ungeprüfter Merge eines abgesenkten
+Limits.
+
+**Auto-Merge greift ausschließlich bei `grow`**, unabhängig von
+`--enable-auto-merge` und der `resizer.io/auto-merge`-Annotation.
+
+**Supersede:** Erkennt der Controller bei offenem Shrink-PR eine echte
+Notlage (die Decision wird zu Grow), schließt er den Shrink-PR mit
+erklärendem Kommentar, setzt `resizer.io/last-shrink` und öffnet im nächsten
+Reconcile den Grow-PR.
+
+**TTL:** Ein Shrink-PR, der `resizer.io/shrink-pr-ttl-days` (Default 7 Tage)
+ohne Review offen bleibt, wird automatisch mit Kommentar geschlossen, ebenfalls
+mit `resizer.io/last-shrink`-Update — ohne diesen Stempel würde der nächste
+Reconcile denselben PR sofort wieder öffnen.
+
+Details: [Design-Dokument, Abschnitt 6](design/2026-08-08-quota-rightsizing.md#6-pr-lifecycle).

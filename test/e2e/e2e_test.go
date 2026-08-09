@@ -69,8 +69,11 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
 
+		// deploy-e2e layers --enable-shrink on top of config/default (see
+		// config/e2e/kustomization.yaml), so the shrink scenario below can run
+		// without changing the production default, which ships disabled.
 		By("deploying the controller-manager")
-		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
+		cmd = exec.Command("make", "deploy-e2e", fmt.Sprintf("IMG=%s", projectImage))
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
 
@@ -410,7 +413,124 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 		})
 	})
+
+	Context("Shrink Simulation", func() {
+		const (
+			shrinkNamespace = "e2e"
+			shrinkQuota     = "compute"
+		)
+		// The state Lease name follows the "state-<namespace>-<quota>"
+		// convention from ARCHITECTURE.md 3.3.
+		shrinkLease := fmt.Sprintf("state-%s-%s", shrinkNamespace, shrinkQuota)
+
+		It("should propose a shrink for an oversized quota", func() {
+			By("creating the target namespace")
+			cmd := exec.Command("kubectl", "create", "ns", shrinkNamespace)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			defer func() {
+				cmd := exec.Command("kubectl", "delete", "ns", shrinkNamespace, "--ignore-not-found")
+				_, _ = utils.Run(cmd)
+			}()
+
+			// The state Lease is created with the window already seeded,
+			// before the ResourceQuota below exists to be reconciled. The
+			// Observer keeps a write-behind, in-memory cache per quota (see
+			// internal/controller/observation.go) that is only ever primed
+			// from the Lease on its *first* Observe call for that quota; an
+			// annotation applied to the Lease after that first reconcile
+			// would be invisible to the running controller for as long as it
+			// keeps the (by then empty) cached window. Seeding before the
+			// quota exists guarantees the first Observe call is the one that
+			// loads this window.
+			By("seeding a fully covered 14-day observation window onto a pre-created lease")
+			window := seedWindow(14, "4")
+			windowLiteral, err := json.Marshal(window)
+			Expect(err).NotTo(HaveOccurred())
+			leaseYaml := fmt.Sprintf(`
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: %s
+  namespace: %s
+  labels:
+    app.kubernetes.io/managed-by: namespace-resizer
+    resizer.io/target-ns: %s
+    resizer.io/quota: %s
+  annotations:
+    resizer.io/observation-window: %s
+`, shrinkLease, namespace, shrinkNamespace, shrinkQuota, windowLiteral)
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(leaseYaml)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			// The quota is 4x the seeded 14-day peak, so the target formula
+			// (peak * 1.25 = 5) lands well outside the tolerance band around
+			// 16, and the step cap (16 * 0.75 = 12) is what actually binds.
+			By("creating an oversized resource quota")
+			quotaYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  hard:
+    requests.cpu: "16"
+`, shrinkQuota, shrinkNamespace)
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(quotaYaml)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for a shrink pull request")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "lease",
+					shrinkLease, "-n", namespace,
+					"-o", "jsonpath={.metadata.annotations['resizer\\.io/pr-direction']}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("shrink"))
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+		})
+	})
 })
+
+// seedWindow builds a JSON observation window covering the given number of
+// completed days at a constant peak, so the shrink gates pass immediately.
+func seedWindow(days int, peak string) string {
+	type bucket struct {
+		Date   string            `json:"d"`
+		N      int               `json:"n"`
+		First  string            `json:"first"`
+		Last   string            `json:"last"`
+		MaxGap string            `json:"maxGap"`
+		Peaks  map[string]string `json:"p"`
+	}
+	payload := struct {
+		Version int      `json:"v"`
+		UID     string   `json:"uid"`
+		Days    []bucket `json:"days"`
+	}{Version: 1}
+
+	now := time.Now().UTC()
+	for i := 1; i <= days; i++ {
+		payload.Days = append(payload.Days, bucket{
+			Date:   now.AddDate(0, 0, -i).Format("2006-01-02"),
+			N:      288,
+			First:  "00:00",
+			Last:   "23:55",
+			MaxGap: "5m0s",
+			Peaks:  map[string]string{"requests.cpu": peak},
+		})
+	}
+
+	raw, err := json.Marshal(payload)
+	Expect(err).NotTo(HaveOccurred())
+	return string(raw)
+}
 
 // serviceAccountToken returns a token for the specified service account in the given namespace.
 // It uses the Kubernetes TokenRequest API to generate a token by directly sending a request

@@ -1,0 +1,15 @@
+# Overlay used only by the e2e suite. It layers --enable-shrink on top of the
+# production defaults in config/default, which ship with shrinking off (see
+# docs/OPERATIONS.md for the rollout rationale). Do not point production
+# installs at this overlay.
+resources:
+- ../default
+
+patches:
+- target:
+    kind: Deployment
+    name: controller-manager
+  patch: |-
+    - op: add
+      path: /spec/template/spec/containers/0/args/-
+      value: --enable-shrink

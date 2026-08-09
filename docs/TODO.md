@@ -36,16 +36,34 @@
 - [x] CI/CD Pipeline für Releases (`.github/workflows/release.yml`)
 - [x] Dokumentation aktualisieren (Installation, Konfiguration)
 
-## Phase 6: Advanced GitOps (Auto-Merge)
-- [ ] Konfiguration: Annotation `resizer.io/auto-merge` definieren
-- [ ] GitHub Provider erweitern:
-    - [ ] `GetPRStatus` (Mergeable, Checks Status)
-    - [ ] `MergePR` (Squash Merge)
-- [ ] Controller Logik:
-    - [ ] Im Reconcile-Loop PR-Status prüfen
-    - [ ] Merge ausführen wenn Conditions met
-- [ ] Tests für Auto-Merge Logik
+## Phase 6: Advanced GitOps (Auto-Merge) (Abgeschlossen)
+- [x] Konfiguration: Annotation `resizer.io/auto-merge` definieren
+- [x] GitHub Provider erweitern:
+    - [x] `GetPRStatus` (Mergeable, Checks Status)
+    - [x] `MergePR` (Squash Merge)
+- [x] Controller Logik:
+    - [x] Im Reconcile-Loop PR-Status prüfen
+    - [x] Merge ausführen wenn Conditions met
+- [x] Tests für Auto-Merge Logik
 
 ## Phase 7: Future Work
 - [ ] Metrics Export (Prometheus)
 - [ ] Webhook für Validierung
+
+## Phase 8: Bidirektionales Quota-Rightsizing (Abgeschlossen)
+
+Details und Herleitung: [Design-Dokument](design/2026-08-08-quota-rightsizing.md).
+
+**Stufe 1 — Beobachtung und Entscheidung, ohne Shrink-PRs**
+- [x] `internal/sizing`: Rolling-Window-Kodierung, Abdeckungsprüfung, Zielformel, Shrink-Gates, Config-Migration (`threshold`/`increment` → `headroom`)
+- [x] Fix für zählbare Ressourcen (z.B. `pods`) bei krummen Zielwerten
+- [x] Sampling ins State-Lease, schreibsparsam
+- [x] Controller auf `sizing.Decide` umgestellt; alter Threshold-Pfad entfernt, Grow-Verhalten durch Migrations-Fallbacks unverändert
+- [x] Prometheus-Metriken (`resizer_quota_target`, `resizer_quota_waste_ratio`, `resizer_shrink_blocked_by`, `resizer_decision_total`)
+
+**Stufe 2 — Shrink-PRs**
+- [x] `ClosePR` am `git.Provider`, `FindOpenPR` um Richtung erweitert, Richtungs-Label beim Erstellen
+- [x] Richtungs-Zustand im Lease, Auto-Merge nur bei `grow`
+- [x] Supersede (Notlage schließt offenen Shrink-PR) und TTL (unreviewter Shrink-PR läuft ab)
+- [x] `--enable-shrink`-Flag (Default aus), `resizer.io/shrink-enabled` als reiner Opt-out
+- [x] envtest- und E2E-Abdeckung, Dokumentation (`ARCHITECTURE.md`, `INSTALLATION.md`, `OPERATIONS.md`, `README.md`)

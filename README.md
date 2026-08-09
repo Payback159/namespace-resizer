@@ -15,10 +15,11 @@ The Namespace Resizer solves this by:
 
 ## Features
 
-*   **Metric-based Resizing:** Increases quota when usage > X% (default 80%).
+*   **Bidirectional Metric-based Resizing:** Follows observed demand in both directions — grows a quota that runs short and proposes a reviewable, step-capped shrink for one that has been oversized for a full observation window (see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).
 *   **Event-based Resizing:** Reacts immediately to denied pods due to quota.
 *   **Generic Resource Support:** Works for CPU, Memory, Storage, and custom resources.
 *   **Configurable:** Fine-tune thresholds and increments via Namespace Annotations.
+*   **Safe Dry-Run Rollout:** Shrinking ships disabled by default; the controller computes and exports every shrink decision as a metric first, so its effect is observable before a single shrink pull request is opened (see [docs/OPERATIONS.md](docs/OPERATIONS.md)).
 *   **GitOps Workflow:** Automates the "Request" part of Quota management.
 
 ## Configuration
