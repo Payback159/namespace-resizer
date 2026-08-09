@@ -303,44 +303,78 @@ func TestDecide_OverflowingUsedIsSkipped(t *testing.T) {
 	}
 }
 
-func TestDecide_UsedSaturatingToZeroIsSkipped(t *testing.T) {
-	// Above roughly 9.2e18, Quantity.Value() does not wrap like MilliValue()
-	// does above 8 PiB -- it saturates to exactly 0 instead (verified
-	// empirically: resource.MustParse("1E30").Value()==0, .IsZero()==false).
-	// The plain "Value() > maxMilliValue" guard reads that as an honestly
-	// small value and lets it through: used.MilliValue() then also comes
-	// back 0, which for a "used" quantity means the resource looks
-	// completely idle. On the shrink side that is fail-open, not fail-safe
-	// -- it proposes shrinking a real quota based on garbage.
-	in := baseInput("10", "1E30", "4")
-
-	got := Decide(in)
-
-	if got.Direction != DirectionNone {
-		t.Fatalf("direction = %v, want none for a used value that saturates to zero", got.Direction)
+// TestDecide_ExtremeUsedValuesAreRejected drives Decide with each of the
+// residue-class examples overflowsMilliValue's doc comment cites: values so
+// large that Quantity.Value() does not clamp or saturate to zero, it
+// returns the low 64 bits of the true value (verified empirically against
+// the pinned k8s.io/apimachinery v0.36.1). Zero is only one of those
+// residues -- 1E30 happens to land on it -- and a guard that only checked
+// for zero let the other three straight through, including one (2^64-1)
+// that reads back negative and would have gone straight into RawTargets.
+func TestDecide_ExtremeUsedValuesAreRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		used string
+	}{
+		{"1E30, Value()=0", "1E30"},
+		{"2^64+1, Value()=1", "18446744073709551617"},
+		{"2^64-1, Value()=-1", "18446744073709551615"},
+		{"2^63, Value()=-9223372036854775808", "9223372036854775808"},
 	}
-	if len(got.Targets) != 0 {
-		t.Fatalf("Targets = %v, want empty", got.Targets)
-	}
-	if _, ok := got.RawTargets[corev1.ResourceRequestsCPU]; ok {
-		t.Fatalf("RawTargets = %v, want no entry for an unmeasurable resource", got.RawTargets)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := baseInput("10", tc.used, "4")
+
+			got := Decide(in)
+
+			if got.Direction != DirectionNone {
+				t.Fatalf("direction = %v, want none for used=%s", got.Direction, tc.used)
+			}
+			if len(got.Targets) != 0 {
+				t.Fatalf("Targets = %v, want empty", got.Targets)
+			}
+			if _, ok := got.RawTargets[corev1.ResourceRequestsCPU]; ok {
+				t.Fatalf("RawTargets = %v, want no entry for an unmeasurable resource", got.RawTargets)
+			}
+		})
 	}
 }
 
-func TestDecide_HardSaturatingToZeroIsSkipped(t *testing.T) {
-	// The mirror case on the hard side, for completeness: a saturated-to-zero
-	// hard limit must not be read as hardMilli==0 and quietly skipped by the
-	// (correct, but coincidental) zero-hard guard for the wrong reason, nor
-	// fall through and have grow/shrink act on it.
-	in := baseInput("1E30", "4", "4")
+// TestDecide_ExtremeHardIsSkipped mirrors the used-side cases for hard, but
+// picks the one residue-class example the pre-existing hardMilli==0 guard
+// would not also catch by coincidence: 2^64+1 reads back as Value()=1 (not
+// 0), so unlike 1E30 it would sail past "hardMilli == 0" and reach the
+// grow/shrink branches on a completely fabricated hard limit if
+// overflowsMilliValue did not catch it on its own.
+func TestDecide_ExtremeHardIsSkipped(t *testing.T) {
+	in := baseInput("18446744073709551617", "4", "4")
 
 	got := Decide(in)
 
 	if got.Direction != DirectionNone {
-		t.Fatalf("direction = %v, want none for a hard value that saturates to zero", got.Direction)
+		t.Fatalf("direction = %v, want none for an unmeasurable hard value", got.Direction)
 	}
 	if len(got.Targets) != 0 {
 		t.Fatalf("Targets = %v, want empty", got.Targets)
+	}
+}
+
+// TestDecide_ZeroUsedIsProcessedNormally guards the other half of
+// overflowsMilliValue: a genuinely zero used value (Sign()==0, IsZero()==
+// true) is not the thing this guard exists to reject and must still reach
+// the ordinary target formula, not be treated as unmeasurable.
+func TestDecide_ZeroUsedIsProcessedNormally(t *testing.T) {
+	in := baseInput("10", "0", "0")
+
+	got := Decide(in)
+
+	// used=0, peak=0, headroom 0.25 -> target 0, well below the tolerance
+	// band around hard=10: a real shrink candidate, not a skip.
+	if got.Direction != DirectionShrink {
+		t.Fatalf("direction = %v, want shrink for a genuinely idle resource", got.Direction)
+	}
+	if _, ok := got.RawTargets[corev1.ResourceRequestsCPU]; !ok {
+		t.Fatalf("RawTargets = %v, want an entry for a genuinely zero used value", got.RawTargets)
 	}
 }
 

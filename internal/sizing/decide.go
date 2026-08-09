@@ -19,21 +19,40 @@ import (
 // (16Pi.Value()=18014398509481984, MilliValue()=-432345564227567616).
 const maxMilliValue = math.MaxInt64 / 1000
 
-// overflowsMilliValue reports whether q is too large for MilliValue() to
-// convert safely. "Too large" has two distinct shapes: a Value() above
-// maxMilliValue, where MilliValue() wraps (see above); and, at a much
-// higher magnitude, a Value() that has itself saturated to exactly 0
-// instead of wrapping (verified empirically:
-// resource.MustParse("1E30").Value()==0, .IsZero()==false). The second case
-// would pass a plain "Value() > maxMilliValue" check undetected and then
-// read as an honestly zero quantity — for a hard limit that reads as
-// "resource not in this quota" and is harmless, but for a used value it
-// reads as "fully idle" and can drive a shrink off garbage.
+// maxMilliRepresentable is maxMilliValue as a Quantity, so it can be
+// compared against with Cmp instead of by inspecting Value(). See
+// overflowsMilliValue for why Value() cannot be trusted to detect this on
+// its own.
+var maxMilliRepresentable = resource.NewQuantity(maxMilliValue, resource.DecimalSI)
+
+// overflowsMilliValue reports whether q is too large, or negative, for
+// MilliValue() to convert safely.
+//
+// This has to compare in the quantity's own arithmetic (Quantity.Cmp, which
+// falls back to arbitrary-precision inf.Dec for values that do not fit in
+// int64) rather than by inspecting Value(): above maxMilliValue, Value()
+// does not clamp or saturate, it returns the low 64 bits of the true value
+// — so "the value is huge" can read back as anything, including a small
+// positive number, a negative one, or an honest-looking zero. Verified
+// empirically against the pinned k8s.io/apimachinery v0.36.1:
+//
+//	1E30                  -> Value()=0
+//	18446744073709551617  -> Value()=1                     (2^64+1)
+//	18446744073709551615  -> Value()=-1                    (2^64-1)
+//	9223372036854775808   -> Value()=-9223372036854775808  (2^63)
+//
+// A prior version of this guard checked "Value() == 0 && !IsZero()", which
+// only ever caught the first row — zero is one residue class out of 2^64,
+// and the other three above all reach past this guard and produce a
+// plausible-looking (wrong) MilliValue(), including a negative one that
+// would corrupt RawTargets.
+//
+// A negative quantity is rejected outright by q.Sign() < 0: Hard and Used
+// are never meant to be negative, and Cmp's ordinary comparison would not
+// catch one on its own — a negative q always compares below the positive
+// maxMilliRepresentable threshold.
 func overflowsMilliValue(q resource.Quantity) bool {
-	if q.Value() > maxMilliValue {
-		return true
-	}
-	return q.Value() == 0 && !q.IsZero()
+	return q.Cmp(*maxMilliRepresentable) > 0 || q.Sign() < 0
 }
 
 // Direction is the kind of change a Decision asks for.
@@ -134,9 +153,9 @@ func Decide(in Input) Decision {
 
 	for res, hard := range in.Hard {
 		if overflowsMilliValue(hard) {
-			// hard.MilliValue() would wrap or, at a higher magnitude, has
-			// already saturated to a false zero; treat the resource as
-			// unmeasurable rather than act on garbage.
+			// hard.MilliValue() cannot be trusted at this magnitude (see
+			// overflowsMilliValue); treat the resource as unmeasurable
+			// rather than act on garbage.
 			continue
 		}
 		hardMilli := hard.MilliValue()

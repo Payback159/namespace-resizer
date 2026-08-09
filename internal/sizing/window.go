@@ -8,9 +8,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
-// maxMilliValue (the largest Quantity.Value() that MilliValue() can convert
-// without wrapping) is defined in decide.go, alongside the empirical
-// measurements behind it.
+// overflowsMilliValue and the empirical measurements behind it are defined
+// in decide.go.
 
 // WindowVersion is the schema version of the persisted observation window.
 // A window carrying any other value is discarded and rebuilt from scratch.
@@ -192,13 +191,12 @@ func (w Window) Peak(res corev1.ResourceName, now time.Time, windowDays int) (in
 			continue
 		}
 		if overflowsMilliValue(qty) {
-			// MilliValue() would wrap above maxMilliValue, or — at a much
-			// higher magnitude — Value() has already saturated to a false
-			// zero (see overflowsMilliValue in decide.go). Either way a
-			// wrapped or falsely-zero historical peak must not enter the
-			// max() below: wrapped could read as huge-negative and mask
-			// real usage or small-positive and understate it, and a false
-			// zero would understate it outright.
+			// A historical peak this large (or negative) cannot be trusted
+			// to convert to a meaningful MilliValue() (see
+			// overflowsMilliValue in decide.go) and must not enter the
+			// max() below: it could read back huge-negative and mask real
+			// usage, small-positive and understate it, or an
+			// honest-looking zero and understate it outright.
 			continue
 		}
 		if milli := qty.MilliValue(); !found || milli > best {
