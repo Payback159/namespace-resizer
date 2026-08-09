@@ -28,6 +28,7 @@ type shrinkHarness struct {
 	reconciler *ResourceQuotaReconciler
 	provider   *FakeGitProvider
 	locker     *lock.LeaseLocker
+	recorder   *record.FakeRecorder
 }
 
 // shrinkHarnessOpts controls the two pieces of extra setup more than one
@@ -145,15 +146,33 @@ func newShrinkHarness(
 			})).To(Succeed())
 	}
 
+	recorder := record.NewFakeRecorder(20)
+
 	return &shrinkHarness{
 		reconciler: &ResourceQuotaReconciler{
-			Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(20),
+			Client: c, Scheme: scheme, Recorder: recorder,
 			GitProvider: provider, Locker: locker,
 			Observer:   NewObserver(locker, time.Now),
 			BasePolicy: policy,
 		},
 		provider: provider,
 		locker:   locker,
+		recorder: recorder,
+	}
+}
+
+// events drains everything the reconcile recorded. FakeRecorder's channel is
+// buffered, so a reconcile that emitted nothing yields an empty slice rather
+// than blocking.
+func (h *shrinkHarness) events() []string {
+	var got []string
+	for {
+		select {
+		case e := <-h.recorder.Events:
+			got = append(got, e)
+		default:
+			return got
+		}
 	}
 }
 
@@ -233,6 +252,9 @@ func TestShrink_YoungPRIsLeftAlone(t *testing.T) {
 
 	g.Expect(h.provider.ClosePRCalls).To(Equal(0))
 	g.Expect(h.provider.MergedPRID).To(Equal(0))
+	// Left alone means left alone: the open-PR switch must not fall into the
+	// grow arm and rewrite a shrink proposal that is still awaiting review.
+	g.Expect(h.provider.UpdatePRCalls).To(Equal(0))
 }
 
 // TestShrink_ZeroCreatedAtNeverExpires verifies that an unpopulated
@@ -303,4 +325,13 @@ func TestShrink_OpensAPullRequest(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(state.PRDirection).To(Equal(git.DirectionShrink))
 	g.Expect(state.PRID).To(Equal(43))
+
+	// The recommendation surfaces on the quota itself, so its wording is
+	// operator-facing: a shrink must not be announced as an increase, and
+	// reclaiming unused quota is not a warning condition.
+	events := h.events()
+	g.Expect(events).To(HaveLen(1))
+	g.Expect(events[0]).To(HavePrefix(corev1.EventTypeNormal))
+	g.Expect(events[0]).To(ContainSubstring("Decrease"))
+	g.Expect(events[0]).NotTo(ContainSubstring("Increase"))
 }
