@@ -4464,7 +4464,49 @@ type PRStatus struct {
 
 - [ ] **Step 4: Handle the shrink PR lifecycle**
 
-In `handleActivePR`, insert this block immediately after `GetPRStatus`
+First, a correction to the closed-PR branch that this task makes necessary.
+Task 11 wrote that branch to stamp nothing when a pull request is closed
+without being merged, and pinned it with a test asserting exactly that. At the
+time it was right: shrink pull requests could not exist, so a closed-unmerged
+pull request was always a rejected grow, and a rejected grow needs no cooldown
+because the shortage that caused it will re-trigger on its own.
+
+This task makes that same branch the primary way a human interacts with a
+shrink. Shrinks are never auto-merged, so closing the pull request *is* the
+rejection mechanism — and without a stamp, `Decide`'s shrink cooldown never
+engages (it keys off a non-zero `LastShrink`), the immediate requeue recomputes
+the same shrink, and the controller reopens an identical pull request seconds
+after the reviewer closed it. The TTL path already stamps for precisely this
+reason and says so in its comment; the human-rejection path needs the same
+treatment, and a rejection deserves it more than a timeout does.
+
+So in the `!status.IsMerged` case, stamp `LastShrink` when the pull request was
+a shrink, and continue to stamp nothing for a grow:
+
+```go
+		if !status.IsMerged {
+			// A closed shrink is a rejection. Without the cooldown stamp the
+			// requeue below would recompute the same shrink and reopen it
+			// immediately. A closed grow needs no stamp: the shortage that
+			// caused it re-triggers on its own.
+			if wasShrink {
+				s.LastShrink = now
+			}
+			return
+		}
+```
+
+This also closes a second path into the same loop: if `ClosePR` succeeds but
+the `MutateState` that follows it fails, the next reconcile arrives here and
+would otherwise drop the cooldown stamp entirely.
+
+Update Task 11's `TestHandleActivePR_ClosedUnmergedShrink_ClearsLockWithoutStamping`
+accordingly — it must now assert that a closed-unmerged *shrink* stamps
+`LastShrink` and leaves `LastGrow` zero, and a companion case must pin that a
+closed-unmerged *grow* still stamps neither. Rename it to say what it now
+checks.
+
+Then, in `handleActivePR`, insert this block immediately after `GetPRStatus`
 succeeds and the PR is confirmed open, before the auto-merge logic:
 
 ```go
@@ -4560,6 +4602,25 @@ mechanism the conflict tests in `internal/lock` use. If no such harness exists
 in `internal/controller`, add the smallest one that makes the event list fail;
 do not skip the test.
 
+Widening the route makes the rest of `handleNewProposal` reachable for a
+shrink, so every part of it that assumed a grow has to be adapted. The
+recommendation event is one: it currently reads
+
+```go
+	msg := fmt.Sprintf("Recommendation: Increase %s from %s to %s", ...)
+	r.Recorder.Event(&quota, corev1.EventTypeWarning, "QuotaResizeRecommended", msg)
+```
+
+which on a shrink produces `Warning QuotaResizeRecommended: Recommendation:
+Increase requests.cpu from 16 to 12` — the verb inverted, and an optimisation
+classified as a shortage. This is visible in `kubectl describe` and to any
+event-based alerting. Derive the verb from `decision.Direction`, and use
+`EventTypeNormal` for a shrink: a proposal to reclaim unused quota is not a
+warning condition.
+
+Read the rest of the function with the same question in mind and report
+anything else that reads as grow-only.
+
 In `handleNewProposal`, skip the grow cooldown for a shrink — the shrink
 cooldown gate in `Decide` already governs it, and applying both would silently
 double the wait:
@@ -4595,16 +4656,47 @@ being written from two different sources:
 Verify it reads exactly like this and move on; do not add a second
 `MutateState` call.
 
-- [ ] **Step 6: Run the full suite**
+- [ ] **Step 6: Pin the route this task exists to open**
+
+The tests above all assert that something is *not* done: a pull request closed,
+left alone, or suppressed. Nothing asserts that a shrink pull request is ever
+opened at all — so reverting the route at the top of Step 5 back to
+`decision.Direction == sizing.DirectionGrow`, which would undo this entire
+task, leaves the whole suite green. That has to be fixed before the task can be
+called done.
+
+Add `TestShrink_OpensAPullRequest`: the fixture from
+`TestShrink_SuppressedByFailedScan` without the interceptor — a complete
+14-day window and metrics that genuinely produce `DirectionShrink` — asserting
+`CreatePRCalls == 1` and `LastDirection == git.DirectionShrink`, and that the
+lease afterwards records `PRDirection` as shrink.
+
+Three of the earlier tests seed no observation window, so `GateWindow` blocks
+and their decision is `DirectionNone` rather than `DirectionShrink`. They
+therefore prove less than their names suggest — `TestShrink_YoungPRIsLeftAlone`
+in particular demonstrates "no decision plus young pull request leaves things
+alone", not the shrink steady state, and no test ever executes the
+`case sizing.DirectionShrink` log branch. Seed the window in the shared
+harness so each test exercises the state it claims to. Since both the window
+and the interceptor are now wanted by more than one test, give
+`newShrinkHarness` optional parameters for them rather than duplicating its
+setup a second time.
+
+While seeding, add the case for a zero `CreatedAt`: an unpopulated timestamp
+must not read as infinitely old and expire the pull request immediately. The
+guard exists; nothing exercises it.
+
+- [ ] **Step 7: Run the full suite**
 
 Run: `make test`
-Expected: PASS, including all three `TestShrink` cases.
+Expected: PASS, including every `TestShrink` case and Task 11's renamed
+closed-unmerged cases.
 
 If `TestShrink_YoungPRIsLeftAlone` fails with a merge instead, the auto-merge
 restriction from Task 11 is not in effect — check the `state.PRDirection`
 comparison there.
 
-- [ ] **Step 7: Lint and commit**
+- [ ] **Step 8: Lint and commit**
 
 ```bash
 make lint
