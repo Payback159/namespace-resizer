@@ -4768,16 +4768,71 @@ Expected: FAIL on the first test — the current parser assigns
 
 - [ ] **Step 3: Make the opt-out one-directional**
 
-In `internal/sizing/policy.go`, replace the `shrink-enabled` case:
+In `internal/sizing/policy.go`, replace the `shrink-enabled` case. An exact,
+case-sensitive comparison against `"false"` is not good enough here: the one
+reason anybody writes this annotation is to opt out, so a spelling we fail to
+recognise — `"False"`, `"0"`, `"no"`, `"disabled"` — silently leaves shrinking
+switched **on** for a namespace whose team was trying to switch it off. Only an
+explicit `"true"` keeps shrinking as the flag left it; everything else opts
+out, and an unrecognised spelling additionally warns.
+
+The asymmetry justifies it: being wrong in this direction costs a quota that is
+not reclaimed, being wrong the other way lowers a limit a team tried to
+protect.
 
 ```go
 		case name == "shrink-enabled":
-			// Opt-out only: a namespace may switch shrinking off, never on.
-			// Enabling it is the operator's decision, made with the flag.
-			if value == "false" {
-				out.ShrinkEnabled = false
+			return parseShrinkOptOut(value, out)
+```
+
+`parseScalar` returns a warning string (empty when there is nothing to say) and
+`ParsePolicy` appends it to the warnings it already collects for deprecated
+annotations:
+
+```go
+		default:
+			if w := parseScalar(name, value, &out); w != "" {
+				warnings = append(warnings, w)
 			}
 ```
+
+```go
+// parseShrinkOptOut applies the shrink-enabled annotation, which is opt-out
+// only: a namespace may switch shrinking off, never on. Enabling it is the
+// operator's decision, made with the flag.
+//
+// Only an explicit "true" leaves shrinking as the flag left it. Every other
+// value switches it off, because the sole reason to write this annotation is
+// to opt out, and a spelling we do not recognise is far likelier to be an
+// attempt at that than a request to keep shrinking on.
+func parseShrinkOptOut(value string, out *Policy) string {
+	switch {
+	case strings.EqualFold(value, trueValue):
+		return ""
+	case strings.EqualFold(value, falseValue):
+		out.ShrinkEnabled = false
+		return ""
+	default:
+		out.ShrinkEnabled = false
+		return fmt.Sprintf("annotation %sshrink-enabled has the unrecognised "+
+			"value %q, so shrinking is switched off for this namespace; "+
+			"use \"true\" or \"false\"", AnnotationPrefix, value)
+	}
+}
+```
+
+Tests must cover: `"true"` leaves the flag's value alone (both when the flag is
+on and when it is off — the latter is the security property); `"false"` and
+`"False"` both opt out; an unrecognised value opts out **and** produces exactly
+one warning; and an empty value opts out. Also pin that a near-miss like
+`"False"` does not silently leave shrinking enabled — that is the case this
+change exists for.
+
+Leave the `enabled` annotation one line above alone. It has the same
+case-sensitivity property, but it governs the whole controller rather than this
+feature, and changing it is not this task's business.
+
+- [ ] **Step 4: Add the annotation constants**
 
 - [ ] **Step 4: Add the annotation constants**
 
