@@ -4524,13 +4524,41 @@ list and pass it from `Reconcile`.
 
 - [ ] **Step 5: Create shrink PRs**
 
-In `Reconcile`, replace the placeholder shrink branch from Task 8:
+In `Reconcile`, replace the placeholder shrink branch from Task 8 — but keep
+its `deficitScanFailed` guard. Task 8 introduced that guard precisely so it
+would already be in place when this branch became actionable, and this is the
+task that makes it actionable. Deleting it here would undo that.
+
+The asymmetry it protects against: a deficit can only ever raise the target, so
+a failed event scan cannot wrongly cause a grow — but it can understate demand
+enough to tip a quota from "no action" into "shrink". A shrink proposed from
+data we know to be incomplete is a bad pull request, and the human-review
+requirement is not a substitute: it puts the burden of catching our bad data on
+the reviewer, who has no way to see that the scan failed.
 
 ```go
+	if decision.Direction == sizing.DirectionShrink && deficitScanFailed {
+		logger.Info("Shrink suppressed: the event scan failed, so the " +
+			"target may be understated")
+		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+	}
+
 	if decision.Direction != sizing.DirectionNone {
 		return r.handleNewProposal(ctx, req, quota, ns, policy, state, decision)
 	}
 ```
+
+Keep the explanatory comment on `deficitScanFailed` at the scan site, updating
+its wording now that the shrink branch is real rather than pending.
+
+This needs a test, since the guard now suppresses a pull request that would
+otherwise be opened: make `collectDeficits` fail and assert that a quota whose
+metrics alone would produce a shrink opens no pull request
+(`FakeGitProvider.CreatePRCalls == 0`). The existing fake client supports
+this — a `List` on events can be made to fail with an interceptor, the same
+mechanism the conflict tests in `internal/lock` use. If no such harness exists
+in `internal/controller`, add the smallest one that makes the event list fail;
+do not skip the test.
 
 In `handleNewProposal`, skip the grow cooldown for a shrink — the shrink
 cooldown gate in `Decide` already governs it, and applying both would silently
