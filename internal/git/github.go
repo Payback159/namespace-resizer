@@ -17,6 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 var ErrFileNotFound = errors.New("file not found")
@@ -252,14 +253,63 @@ func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace, dir
 		fmt.Sprintf("resizer/ns:%s", namespace),
 		labelDirectionPrefix + direction,
 	}
-	_, _, err = g.client.Issues.AddLabelsToIssue(ctx, g.owner, g.repo, pr.GetNumber(), labels)
-	if err != nil {
-		// A missing label is not worth failing the whole flow, but it does
-		// degrade orphan recovery, so log it at error level.
-		fmt.Printf("Failed to add labels to PR %d: %v\n", pr.GetNumber(), err)
+	if err := g.addLabels(ctx, pr.GetNumber(), labels); err != nil {
+		logger := log.FromContext(ctx)
+		if direction != DirectionShrink {
+			// A grow pull request with no label is recovered as grow anyway,
+			// so the only cost is a less precise audit trail.
+			logger.Error(err, "failed to label pull request",
+				"pr", pr.GetNumber(), "direction", direction)
+			return pr.GetNumber(), nil
+		}
+		// An unlabelled shrink is indistinguishable from a grow once this
+		// process forgets it, and grow pull requests are the ones eligible
+		// for auto-merge. Take the pull request back rather than leave a
+		// mergeable shrink behind.
+		logger.Error(err, "failed to label shrink pull request, closing it again",
+			"pr", pr.GetNumber())
+		if closeErr := g.ClosePR(ctx, pr.GetNumber(), unlabelledShrinkComment); closeErr != nil {
+			return 0, fmt.Errorf(
+				"failed to label shrink PR %d (%w) and failed to close it again: %w",
+				pr.GetNumber(), err, closeErr)
+		}
+		return 0, fmt.Errorf("failed to label shrink PR %d, closed it again: %w",
+			pr.GetNumber(), err)
 	}
 
 	return pr.GetNumber(), nil
+}
+
+const unlabelledShrinkComment = "Closing this pull request: its direction " +
+	"label could not be attached, and an unlabelled shrink proposal would " +
+	"later be mistaken for a growth proposal. A replacement will be opened " +
+	"on the next reconcile."
+
+// labelAttempts is how often CreatePR tries to attach the labels before it
+// treats the failure as final.
+const labelAttempts = 3
+
+// labelRetryBackoff is a variable so tests can zero it.
+var labelRetryBackoff = 500 * time.Millisecond
+
+func (g *GitHubProvider) addLabels(ctx context.Context, prNumber int, labels []string) error {
+	var err error
+	for attempt := 1; attempt <= labelAttempts; attempt++ {
+		if _, _, err = g.client.Issues.AddLabelsToIssue(
+			ctx, g.owner, g.repo, prNumber, labels); err == nil {
+			return nil
+		}
+		if attempt == labelAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("labelling PR %d cancelled: %w", prNumber, ctx.Err())
+		case <-time.After(labelRetryBackoff):
+		}
+	}
+	return fmt.Errorf("failed to label PR %d after %d attempts: %w",
+		prNumber, labelAttempts, err)
 }
 
 func (g *GitHubProvider) UpdatePR(ctx context.Context, prID int, quotaName, namespace string, annotations map[string]string, newLimits map[corev1.ResourceName]resource.Quantity) error {
@@ -352,17 +402,27 @@ func (g *GitHubProvider) FindOpenPR(ctx context.Context, namespace, quotaName st
 	return 0, "", nil
 }
 
-// directionFromLabels reads the direction label. Pull requests created before
-// the label existed carry none; treating them as grow preserves the previous
-// behaviour and never enables an unreviewed shrink merge.
+// directionFromLabels reads the direction label and never invents a value it
+// did not recognise.
+//
+// No direction label at all means the pull request predates the label;
+// classifying it as grow preserves the behaviour those pull requests were
+// opened under. A label that is present but is not exactly "grow" is a
+// different case: labels are writable by anyone with repository access, so an
+// unrecognised value is evidence that something other than this controller
+// wrote it. Reading it as shrink is the safe direction — shrink proposals are
+// never auto-merged, so the cost of being wrong is one human review, whereas
+// reading it as grow would cost an unreviewed merge of lowered limits.
 func directionFromLabels(labels []*github.Label) string {
 	for _, label := range labels {
 		name := label.GetName()
-		if strings.HasPrefix(name, labelDirectionPrefix) {
-			if value := strings.TrimPrefix(name, labelDirectionPrefix); value != "" {
-				return value
-			}
+		if !strings.HasPrefix(name, labelDirectionPrefix) {
+			continue
 		}
+		if strings.TrimPrefix(name, labelDirectionPrefix) == DirectionGrow {
+			return DirectionGrow
+		}
+		return DirectionShrink
 	}
 	return DirectionGrow
 }

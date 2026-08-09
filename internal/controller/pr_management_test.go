@@ -82,7 +82,8 @@ type fakeClientBundle struct {
 
 // TestHandleNewProposal_AdoptsOrphanedPR verifies that when a previous reconcile
 // created a PR but failed to record the lock, the next reconcile adopts the
-// existing PR instead of opening a duplicate.
+// existing PR instead of opening a duplicate, and persists the direction the
+// provider reported for it.
 func TestHandleNewProposal_AdoptsOrphanedPR(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.TODO()
@@ -103,6 +104,73 @@ func TestHandleNewProposal_AdoptsOrphanedPR(t *testing.T) {
 	id, err := b.locker.GetLock(ctx, prTestNS, prTestQuota)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(id).To(Equal(555))
+
+	state, err := b.locker.GetState(ctx, prTestNS, prTestQuota)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(state.PRDirection).To(Equal(git.DirectionGrow), "no direction on the fake defaults to grow")
+}
+
+// TestHandleNewProposal_AdoptsOrphanedShrinkPR verifies that adopting an
+// orphaned PR persists a reported shrink direction as shrink, not grow.
+// Without this, the hardcoded-grow defect this task removes would still pass
+// every test.
+func TestHandleNewProposal_AdoptsOrphanedShrinkPR(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.TODO()
+
+	r, b := newPRTestReconciler(t)
+	fakeGit := &FakeGitProvider{ExistingPR: 555, ExistingPRDirection: git.DirectionShrink}
+	r.GitProvider = fakeGit
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: prTestQuota, Namespace: prTestNS}}
+	_, err := r.Reconcile(ctx, req)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	state, err := b.locker.GetState(ctx, prTestNS, prTestQuota)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(state.PRID).To(Equal(555))
+	g.Expect(state.PRDirection).To(Equal(git.DirectionShrink),
+		"adoption must persist the direction the provider reported, not a hardcoded default")
+}
+
+// TestHandleNewProposal_RecordsDecisionDirectionOnCreate guards the create
+// path directly: the direction and timestamp written to the lease after
+// CreatePR must come from the decision actually passed to CreatePR, not a
+// hardcoded default. Reconcile only ever routes to handleNewProposal with a
+// grow decision today (Task 12 wires up the shrink route), so this calls
+// handleNewProposal directly with a shrink decision to prove the plumbing
+// itself — not just today's grow-only caller — is correct.
+func TestHandleNewProposal_RecordsDecisionDirectionOnCreate(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.TODO()
+
+	r, b := newPRTestReconciler(t)
+	fakeGit := &FakeGitProvider{CreatePRID: 999}
+	r.GitProvider = fakeGit
+
+	quota := newResizeNeededQuota()
+	ns := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: prTestNS}}
+	policy := sizing.DefaultPolicy()
+	decision := sizing.Decision{
+		Direction: sizing.DirectionShrink,
+		Targets: map[corev1.ResourceName]resource.Quantity{
+			corev1.ResourceRequestsCPU: resource.MustParse("5"),
+		},
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: prTestQuota, Namespace: prTestNS}}
+	_, err := r.handleNewProposal(ctx, req, *quota, ns, policy, lock.State{}, decision)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	g.Expect(fakeGit.LastDirection).To(Equal(git.DirectionShrink), "CreatePR must receive the decision's direction")
+
+	got, err := b.locker.GetState(ctx, prTestNS, prTestQuota)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(got.PRID).To(Equal(999))
+	g.Expect(got.PRDirection).To(Equal(git.DirectionShrink),
+		"the lease must record the direction actually passed to CreatePR")
+	g.Expect(got.LastShrink.IsZero()).To(BeFalse(), "a shrink creation must stamp LastShrink")
+	g.Expect(got.LastGrow.IsZero()).To(BeTrue(), "a shrink creation must not also stamp LastGrow")
 }
 
 // TestHandleNewProposal_CreatesWhenNoOrphan verifies normal creation when no

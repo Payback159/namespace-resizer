@@ -349,8 +349,12 @@ func (r *ResourceQuotaReconciler) handleNewProposal(
 	logger.Info("PR created, acquiring lock", "prID", newPRID)
 	err = r.Locker.MutateState(ctx, req.Namespace, quota.Name, func(s *lock.State) {
 		s.PRID = newPRID
-		s.PRDirection = sizing.DirectionGrow.String()
-		s.LastGrow = time.Now()
+		s.PRDirection = decision.Direction.String()
+		if decision.Direction == sizing.DirectionShrink {
+			s.LastShrink = time.Now()
+		} else {
+			s.LastGrow = time.Now()
+		}
 	})
 	if err != nil {
 		logger.Error(err, "failed to record the new pull request")

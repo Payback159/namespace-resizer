@@ -261,3 +261,179 @@ func TestClosePR_CommentsThenCloses(t *testing.T) {
 		t.Error("PR was not closed")
 	}
 }
+
+func TestFindOpenPR_UnknownDirectionReadsAsShrink(t *testing.T) {
+	cases := []struct {
+		name  string
+		label string
+	}{
+		{"wrong case", "resizer/direction:Shrink"},
+		{"unrecognised value", "resizer/direction:banana"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			mux := http.NewServeMux()
+			mux.HandleFunc("/repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `[{
+					"number": 42,
+					"head": {"ref": "resize/team-a-compute-1700000000"},
+					"labels": [{"name": %q}]
+				}]`, tc.label)
+			})
+			provider, teardown := newTestProvider(t, mux)
+			defer teardown()
+
+			_, direction, err := provider.FindOpenPR(context.Background(), "team-a", "compute")
+
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(direction).To(Equal(DirectionShrink))
+		})
+	}
+}
+
+// setupCreatePRRoutes registers every handler CreatePR needs before it
+// reaches the labelling step: repo lookup, base ref, branch creation, the
+// quota file listing/get/put, and PR creation itself, all returning the
+// given PR number.
+func setupCreatePRRoutes(g *WithT, mux *http.ServeMux, prNumber int) {
+	mux.HandleFunc("/repos/o/r", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"default_branch": "main"}`)
+	})
+	mux.HandleFunc("/repos/o/r/git/ref/heads/main", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"object": {"sha": "base-sha"}}`)
+	})
+	mux.HandleFunc("/repos/o/r/git/refs", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"ref": "refs/heads/new-branch"}`)
+	})
+	mux.HandleFunc("/repos/o/r/contents/managed-resources/cluster/default", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[
+			{"name": "quota.yaml", "path": "managed-resources/cluster/default/quota.yaml", "type": "file"}
+		]`)
+	})
+	mux.HandleFunc("/repos/o/r/contents/managed-resources/cluster/default/quota.yaml", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = fmt.Fprint(w, `{"content": "a2luZDogUmVzb3VyY2VRdW90YQptZXRhZGF0YToKICBuYW1lOiBteS1xdW90YQpzcGVjOgogIGhhcmQ6CiAgICByZXF1ZXN0cy5jcHU6IDE=", "encoding": "base64", "sha": "file-sha"}`)
+		case http.MethodPut:
+			_, _ = fmt.Fprint(w, `{"commit": {"sha": "new-sha"}}`)
+		}
+	})
+	mux.HandleFunc("/repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		g.Expect(r.Method).To(Equal(http.MethodPost))
+		_, _ = fmt.Fprintf(w, `{"number": %d, "state": "open"}`, prNumber)
+	})
+}
+
+func createPRLimits() map[corev1.ResourceName]resource.Quantity {
+	return map[corev1.ResourceName]resource.Quantity{
+		corev1.ResourceRequestsCPU: resource.MustParse("2"),
+	}
+}
+
+// TestCreatePR_AttachesDirectionLabel is the assertion the label handler in
+// TestCreatePR never made: that the direction actually reaches GitHub as a
+// label, for both directions.
+func TestCreatePR_AttachesDirectionLabel(t *testing.T) {
+	cases := []struct {
+		name      string
+		direction string
+		wantLabel string
+	}{
+		{"shrink", DirectionShrink, "resizer/direction:shrink"},
+		{"grow", DirectionGrow, "resizer/direction:grow"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			var gotBody []byte
+			mux := http.NewServeMux()
+			setupCreatePRRoutes(g, mux, 101)
+			mux.HandleFunc("/repos/o/r/issues/101/labels", func(w http.ResponseWriter, r *http.Request) {
+				var err error
+				gotBody, err = io.ReadAll(r.Body)
+				g.Expect(err).ToNot(HaveOccurred())
+				_, _ = fmt.Fprint(w, `[]`)
+			})
+			provider, teardown := newTestProvider(t, mux)
+			defer teardown()
+
+			prID, err := provider.CreatePR(context.Background(), "my-quota", "default", tc.direction, nil, createPRLimits())
+
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(prID).To(Equal(101))
+			g.Expect(string(gotBody)).To(ContainSubstring(tc.wantLabel))
+		})
+	}
+}
+
+// TestCreatePR_ShrinkClosesItselfWhenLabellingFails covers the write half of
+// the safety boundary: a shrink PR that cannot be labelled must not survive
+// as an unlabelled (and therefore grow-classified, auto-mergeable) PR.
+func TestCreatePR_ShrinkClosesItselfWhenLabellingFails(t *testing.T) {
+	g := NewWithT(t)
+	original := labelRetryBackoff
+	labelRetryBackoff = 0
+	t.Cleanup(func() { labelRetryBackoff = original })
+
+	var labelAttemptsMade int
+	var commented, closed bool
+	mux := http.NewServeMux()
+	setupCreatePRRoutes(g, mux, 101)
+	mux.HandleFunc("/repos/o/r/issues/101/labels", func(w http.ResponseWriter, r *http.Request) {
+		labelAttemptsMade++
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/repos/o/r/issues/101/comments", func(w http.ResponseWriter, r *http.Request) {
+		commented = true
+		_, _ = fmt.Fprint(w, `{"id": 1}`)
+	})
+	mux.HandleFunc("/repos/o/r/pulls/101", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			closed = true
+		}
+		_, _ = fmt.Fprint(w, `{"number": 101, "state": "closed"}`)
+	})
+	provider, teardown := newTestProvider(t, mux)
+	defer teardown()
+
+	prID, err := provider.CreatePR(context.Background(), "my-quota", "default", DirectionShrink, nil, createPRLimits())
+
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(prID).To(Equal(0))
+	g.Expect(labelAttemptsMade).To(Equal(labelAttempts))
+	g.Expect(commented).To(BeTrue(), "the reason must survive as a comment")
+	g.Expect(closed).To(BeTrue(), "an unlabelled shrink must not be left open")
+}
+
+// TestCreatePR_GrowSurvivesLabellingFailure asserts the lenient side of the
+// same boundary: a grow PR with a failed label is still usable, since an
+// unlabelled PR already defaults to grow.
+func TestCreatePR_GrowSurvivesLabellingFailure(t *testing.T) {
+	g := NewWithT(t)
+	original := labelRetryBackoff
+	labelRetryBackoff = 0
+	t.Cleanup(func() { labelRetryBackoff = original })
+
+	var closeCalled bool
+	mux := http.NewServeMux()
+	setupCreatePRRoutes(g, mux, 101)
+	mux.HandleFunc("/repos/o/r/issues/101/labels", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/repos/o/r/pulls/101", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			closeCalled = true
+		}
+		_, _ = fmt.Fprint(w, `{"number": 101, "state": "open"}`)
+	})
+	provider, teardown := newTestProvider(t, mux)
+	defer teardown()
+
+	prID, err := provider.CreatePR(context.Background(), "my-quota", "default", DirectionGrow, nil, createPRLimits())
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(prID).To(Equal(101))
+	g.Expect(closeCalled).To(BeFalse())
+}
