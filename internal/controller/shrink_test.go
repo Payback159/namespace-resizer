@@ -30,6 +30,21 @@ type shrinkHarness struct {
 	locker     *lock.LeaseLocker
 }
 
+// shrinkHarnessOpts controls the two pieces of extra setup more than one
+// shrink test needs, so neither has to be duplicated per test.
+type shrinkHarnessOpts struct {
+	// window, when true, seeds a fully covered observation window for every
+	// day the default policy requires. Without it, GateWindow blocks any
+	// shrink target and the decision is DirectionNone regardless of how
+	// oversized the quota looks — a test that wants a genuine shrink
+	// decision (not merely metrics that would produce one if the window
+	// were complete) needs this set.
+	window bool
+	// failEventScan, when true, makes the event List call fail, simulating
+	// a scan that could not observe a pending shortage.
+	failEventScan bool
+}
+
 // shortageObjects returns the event and the owning ReplicaSet that make
 // collectDeficits report a pending shortage of the given size. The ReplicaSet
 // has to exist because the controller ignores events whose involved object is
@@ -63,9 +78,11 @@ func shortageObjects(requestedCPU string) []client.Object {
 func newShrinkHarness(
 	t *testing.T,
 	status *git.PRStatus,
+	opts shrinkHarnessOpts,
 	extra ...client.Object,
 ) *shrinkHarness {
 	t.Helper()
+	g := NewWithT(t)
 
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
@@ -88,12 +105,45 @@ func newShrinkHarness(
 	}
 
 	objects := append([]client.Object{ns, quota}, extra...)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...)
+	if opts.failEventScan {
+		builder = builder.WithInterceptorFuncs(interceptor.Funcs{
+			List: func(
+				ctx context.Context, cl client.WithWatch,
+				list client.ObjectList, listOpts ...client.ListOption,
+			) error {
+				if _, ok := list.(*corev1.EventList); ok {
+					return errors.New("injected event-scan failure")
+				}
+				return cl.List(ctx, list, listOpts...)
+			},
+		})
+	}
+	c := builder.Build()
+
 	locker := lock.NewLeaseLocker(c)
 	provider := &FakeGitProvider{PRStatus: status, CreatePRID: 43}
 
 	policy := sizing.DefaultPolicy()
 	policy.ShrinkEnabled = true
+
+	if opts.window {
+		now := time.Now()
+		window := sizing.Window{}
+		for i := 1; i <= policy.WindowDays; i++ {
+			date := now.UTC().AddDate(0, 0, -i).Format("2006-01-02")
+			window.Days = append(window.Days, sizing.DayBucket{
+				Date: date, N: 2, First: "00:00", Last: "23:59",
+				Peaks: map[string]string{"requests.cpu": "4"},
+			})
+		}
+		encoded, err := sizing.EncodeWindow(window)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(locker.MutateState(context.Background(), "team-a", "compute",
+			func(s *lock.State) {
+				s.Window = encoded
+			})).To(Succeed())
+	}
 
 	return &shrinkHarness{
 		reconciler: &ResourceQuotaReconciler{
@@ -122,7 +172,7 @@ func TestShrink_SupersededByAShortage(t *testing.T) {
 	h := newShrinkHarness(t, &git.PRStatus{
 		IsOpen:    true,
 		CreatedAt: time.Now().Add(-3 * 24 * time.Hour),
-	}, shortageObjects("20")...)
+	}, shrinkHarnessOpts{window: true}, shortageObjects("20")...)
 
 	g.Expect(h.locker.MutateState(ctx, "team-a", "compute", func(s *lock.State) {
 		s.PRID = 42
@@ -149,7 +199,7 @@ func TestShrink_ExpiresAfterTTL(t *testing.T) {
 	h := newShrinkHarness(t, &git.PRStatus{
 		IsOpen:    true,
 		CreatedAt: time.Now().Add(-8 * 24 * time.Hour),
-	})
+	}, shrinkHarnessOpts{window: true})
 	g.Expect(h.locker.MutateState(ctx, "team-a", "compute", func(s *lock.State) {
 		s.PRID = 42
 		s.PRDirection = git.DirectionShrink
@@ -173,7 +223,7 @@ func TestShrink_YoungPRIsLeftAlone(t *testing.T) {
 	h := newShrinkHarness(t, &git.PRStatus{
 		IsOpen:    true,
 		CreatedAt: time.Now().Add(-2 * 24 * time.Hour),
-	})
+	}, shrinkHarnessOpts{window: true})
 	g.Expect(h.locker.MutateState(ctx, "team-a", "compute", func(s *lock.State) {
 		s.PRID = 42
 		s.PRDirection = git.DirectionShrink
@@ -185,90 +235,72 @@ func TestShrink_YoungPRIsLeftAlone(t *testing.T) {
 	g.Expect(h.provider.MergedPRID).To(Equal(0))
 }
 
+// TestShrink_ZeroCreatedAtNeverExpires verifies that an unpopulated
+// CreatedAt — the provider legitimately returning the zero value — is never
+// read as infinitely old. Without the explicit zero check in
+// shrinkPRShouldClose, time.Since(zero value) is many decades, which would
+// make every shrink pull request appear to have blown its TTL on the very
+// first reconcile after it opened.
+func TestShrink_ZeroCreatedAtNeverExpires(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+
+	h := newShrinkHarness(t, &git.PRStatus{
+		IsOpen:    true,
+		CreatedAt: time.Time{},
+	}, shrinkHarnessOpts{window: true})
+	g.Expect(h.locker.MutateState(ctx, "team-a", "compute", func(s *lock.State) {
+		s.PRID = 42
+		s.PRDirection = git.DirectionShrink
+	})).To(Succeed())
+
+	g.Expect(h.reconcile(ctx)).To(Succeed())
+
+	g.Expect(h.provider.ClosePRCalls).To(Equal(0),
+		"a zero CreatedAt must not read as infinitely old")
+}
+
 // TestShrink_SuppressedByFailedScan verifies that a failed event scan
 // suppresses an otherwise-actionable shrink instead of letting it reach
 // handleNewProposal on an understated deficit picture. A deficit can only
 // ever raise a target, never lower one, so a scan failure can silently tip a
-// quota from "no action" into "shrink" — the fixture below seeds a fully
-// covered 14-day observation window so that metrics alone (Hard 16, Used 4,
-// no deficit either way) already cross into a real shrink decision once the
-// window gate clears. The event List call is then made to fail, and no pull
-// request must be created.
+// quota from "no action" into "shrink" — the fully covered window makes the
+// metrics alone (Hard 16, Used 4, no deficit either way) already cross into
+// a real shrink decision once the window gate clears. The event List call is
+// then made to fail, and no pull request must be created.
 func TestShrink_SuppressedByFailedScan(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
-	now := time.Now()
 
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = appsv1.AddToScheme(scheme)
-	_ = coordinationv1.AddToScheme(scheme)
+	h := newShrinkHarness(t, &git.PRStatus{},
+		shrinkHarnessOpts{window: true, failEventScan: true})
 
-	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a"}}
-	quota := &corev1.ResourceQuota{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "compute", Namespace: "team-a", UID: types.UID("uid-1"),
-		},
-		Status: corev1.ResourceQuotaStatus{
-			Hard: corev1.ResourceList{
-				corev1.ResourceRequestsCPU: resource.MustParse("16"),
-			},
-			Used: corev1.ResourceList{
-				corev1.ResourceRequestsCPU: resource.MustParse("4"),
-			},
-		},
-	}
+	g.Expect(h.reconcile(ctx)).To(Succeed())
 
-	c := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(ns, quota).
-		WithInterceptorFuncs(interceptor.Funcs{
-			List: func(
-				ctx context.Context, cl client.WithWatch,
-				list client.ObjectList, opts ...client.ListOption,
-			) error {
-				if _, ok := list.(*corev1.EventList); ok {
-					return errors.New("injected event-scan failure")
-				}
-				return cl.List(ctx, list, opts...)
-			},
-		}).
-		Build()
-
-	locker := lock.NewLeaseLocker(c)
-	provider := &FakeGitProvider{PRStatus: &git.PRStatus{}, CreatePRID: 43}
-
-	policy := sizing.DefaultPolicy()
-	policy.ShrinkEnabled = true
-
-	reconciler := &ResourceQuotaReconciler{
-		Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(20),
-		GitProvider: provider, Locker: locker,
-		Observer:   NewObserver(locker, time.Now),
-		BasePolicy: policy,
-	}
-
-	// Seed a fully covered window for every day the policy requires so the
-	// window gate does not itself block the shrink.
-	window := sizing.Window{}
-	for i := 1; i <= policy.WindowDays; i++ {
-		date := now.UTC().AddDate(0, 0, -i).Format("2006-01-02")
-		window.Days = append(window.Days, sizing.DayBucket{
-			Date: date, N: 2, First: "00:00", Last: "23:59",
-			Peaks: map[string]string{"requests.cpu": "4"},
-		})
-	}
-	encoded, err := sizing.EncodeWindow(window)
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(locker.MutateState(ctx, "team-a", "compute", func(s *lock.State) {
-		s.Window = encoded
-	})).To(Succeed())
-
-	_, err = reconciler.Reconcile(ctx, ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "compute", Namespace: "team-a"},
-	})
-	g.Expect(err).NotTo(HaveOccurred())
-
-	g.Expect(provider.CreatePRCalls).To(Equal(0),
+	g.Expect(h.provider.CreatePRCalls).To(Equal(0),
 		"a failed event scan must suppress the shrink, not propose it understated")
+}
+
+// TestShrink_OpensAPullRequest pins the route this task exists to open: a
+// genuine shrink decision, reached with no active lock, must actually create
+// a pull request with the shrink direction — and persist that direction on
+// the lease. Every other test in this file asserts that something is *not*
+// done (a pull request closed, left alone, or suppressed); without this one,
+// reverting the routing in Reconcile back to grow-only would leave the whole
+// suite green.
+func TestShrink_OpensAPullRequest(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+
+	h := newShrinkHarness(t, &git.PRStatus{}, shrinkHarnessOpts{window: true})
+
+	g.Expect(h.reconcile(ctx)).To(Succeed())
+
+	g.Expect(h.provider.CreatePRCalls).To(Equal(1))
+	g.Expect(h.provider.LastDirection).To(Equal(git.DirectionShrink))
+
+	state, err := h.locker.GetState(ctx, "team-a", "compute")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(state.PRDirection).To(Equal(git.DirectionShrink))
+	g.Expect(state.PRID).To(Equal(43))
 }

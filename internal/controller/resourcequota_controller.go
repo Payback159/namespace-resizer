@@ -170,6 +170,13 @@ func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.R
 			s.PRID = 0
 			s.PRDirection = ""
 			if !status.IsMerged {
+				// A closed shrink is a rejection. Without the cooldown stamp
+				// the requeue below would recompute the same shrink and
+				// reopen it immediately. A closed grow needs no stamp: the
+				// shortage that caused it re-triggers on its own.
+				if wasShrink {
+					s.LastShrink = now
+				}
 				return
 			}
 			s.LastModified = now
@@ -272,8 +279,9 @@ func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.R
 	// the PR: a shrink decision reaching this point would otherwise lower the
 	// limits on an open grow PR, which the auto-merge block above could then
 	// merge — breaking the rule that a shrink is never auto-merged. A shrink
-	// decision on an open shrink PR is handled above, before auto-merge, by
-	// shrinkPRShouldClose; it never reaches here.
+	// decision on an open shrink PR that shrinkPRShouldClose left alone (not
+	// superseded, not expired) falls through to the DirectionShrink case
+	// below, which does not call UpdatePR.
 	switch decision.Direction {
 	case sizing.DirectionGrow:
 		logger.Info("PR is open, updating if needed", "prID", prID)
@@ -310,10 +318,23 @@ func shrinkPRShouldClose(
 	if !status.CreatedAt.IsZero() &&
 		time.Since(status.CreatedAt) > policy.ShrinkPRTTL {
 		return "Closing automatically: this shrink proposal has been open for " +
-			policy.ShrinkPRTTL.String() + " without review. A fresh proposal " +
-			"will be opened once the cooldown expires.", true
+			formatDays(policy.ShrinkPRTTL) + " without review. A fresh " +
+			"proposal will be opened once the cooldown expires.", true
 	}
 	return "", false
+}
+
+// formatDays renders a duration as whole days for a human-facing comment.
+// time.Duration.String() would render policy.ShrinkPRTTL's default as
+// "168h0m0s", which nobody reviewing a pull request wants to do arithmetic
+// on. ShrinkPRTTL is always configured in whole days (see policy.go), so
+// integer division loses nothing.
+func formatDays(d time.Duration) string {
+	days := int(d / (24 * time.Hour))
+	if days == 1 {
+		return "1 day"
+	}
+	return fmt.Sprintf("%d days", days)
 }
 
 // handleNewProposal manages the creation of new Pull Requests
@@ -387,13 +408,18 @@ func (r *ResourceQuotaReconciler) handleNewProposal(
 	}
 
 	// 3. Create PR
-	// Log recommendation
+	// Log recommendation. A shrink is an optimisation, not a shortage: it
+	// gets the opposite verb and a Normal event instead of a Warning.
+	verb, eventType := "Increase", corev1.EventTypeWarning
+	if decision.Direction == sizing.DirectionShrink {
+		verb, eventType = "Decrease", corev1.EventTypeNormal
+	}
 	for res, newLimit := range recommendations {
 		currentLimit := quota.Status.Hard[res]
-		msg := fmt.Sprintf("Recommendation: Increase %s from %s to %s",
-			res, currentLimit.String(), newLimit.String())
+		msg := fmt.Sprintf("Recommendation: %s %s from %s to %s",
+			verb, res, currentLimit.String(), newLimit.String())
 		logger.Info(msg)
-		r.Recorder.Event(&quota, corev1.EventTypeWarning, "QuotaResizeRecommended", msg)
+		r.Recorder.Event(&quota, eventType, "QuotaResizeRecommended", msg)
 	}
 
 	logger.Info("No lock found, creating PR")
