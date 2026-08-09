@@ -7,6 +7,7 @@ import (
 
 	. "github.com/onsi/gomega"
 	coordinationv1 "k8s.io/api/coordination/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -98,7 +99,9 @@ func TestMutateState_PreservesExistingLastModified(t *testing.T) {
 	ctx := context.Background()
 	modified := time.Date(2026, 7, 30, 8, 0, 0, 0, time.UTC)
 
-	g.Expect(locker.SetLastModified(ctx, testNamespace, testQuotaName, modified)).To(Succeed())
+	g.Expect(locker.MutateState(ctx, testNamespace, testQuotaName, func(s *State) {
+		s.LastModified = modified
+	})).To(Succeed())
 
 	g.Expect(locker.MutateState(ctx, testNamespace, testQuotaName, func(s *State) {
 		s.Window = "{}"
@@ -107,4 +110,32 @@ func TestMutateState_PreservesExistingLastModified(t *testing.T) {
 	state, err := locker.GetState(ctx, testNamespace, testQuotaName)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(state.LastModified.Equal(modified)).To(BeTrue())
+}
+
+// TestGetState_ParsesNonUTCOffsetStamp verifies that a stamp already on disk
+// in a non-UTC offset — what a lease written before setStamp normalised to
+// UTC would carry, or any other writer that didn't — is still parsed back to
+// the correct instant. setStamp itself always writes UTC; this covers the
+// read side finding something it did not write.
+func TestGetState_ParsesNonUTCOffsetStamp(t *testing.T) {
+	g := NewWithT(t)
+	locker, c := newStateLocker()
+	ctx := context.Background()
+
+	written := time.Date(2026, 7, 30, 10, 0, 0, 0, time.FixedZone("CEST", 2*60*60))
+
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "state-" + testNamespace + "-" + testQuotaName,
+			Namespace: ControllerNamespace,
+			Annotations: map[string]string{
+				AnnotationLastModified: written.Format(time.RFC3339),
+			},
+		},
+	}
+	g.Expect(c.Create(ctx, lease)).To(Succeed())
+
+	state, err := locker.GetState(ctx, testNamespace, testQuotaName)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(state.LastModified.Equal(written)).To(BeTrue())
 }

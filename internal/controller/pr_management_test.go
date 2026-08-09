@@ -101,12 +101,9 @@ func TestHandleNewProposal_AdoptsOrphanedPR(t *testing.T) {
 	g.Expect(fakeGit.FindOpenPRCalls).To(Equal(1))
 
 	// The orphaned PR (555) must now be locked.
-	id, err := b.locker.GetLock(ctx, prTestNS, prTestQuota)
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(id).To(Equal(555))
-
 	state, err := b.locker.GetState(ctx, prTestNS, prTestQuota)
 	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(state.PRID).To(Equal(555))
 	g.Expect(state.PRDirection).To(Equal(git.DirectionGrow), "no direction on the fake defaults to grow")
 }
 
@@ -190,9 +187,9 @@ func TestHandleNewProposal_CreatesWhenNoOrphan(t *testing.T) {
 	g.Expect(fakeGit.FindOpenPRCalls).To(Equal(1))
 	g.Expect(fakeGit.CreatePRCalls).To(Equal(1), "must create exactly one PR")
 
-	id, err := b.locker.GetLock(ctx, prTestNS, prTestQuota)
+	state, err := b.locker.GetState(ctx, prTestNS, prTestQuota)
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(id).To(Equal(777))
+	g.Expect(state.PRID).To(Equal(777))
 }
 
 // TestHandleActivePR_MergeReleasesLock verifies that a successful auto-merge
@@ -233,12 +230,100 @@ func TestHandleActivePR_MergeReleasesLock(t *testing.T) {
 	g.Expect(fakeGit.MergedPRID).To(Equal(123))
 
 	// The lock must be released right away.
-	id, err := locker.GetLock(ctx, prTestNS, prTestQuota)
+	state, err := locker.GetState(ctx, prTestNS, prTestQuota)
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(id).To(Equal(0), "lock must be released immediately after merge")
+	g.Expect(state.PRID).To(Equal(0), "lock must be released immediately after merge")
 
 	// The last-modified timestamp must be recorded to start the cooldown.
-	lastMod, err := locker.GetLastModified(ctx, prTestNS, prTestQuota)
+	g.Expect(state.LastModified.IsZero()).To(BeFalse(), "last-modified must be set after merge")
+}
+
+// TestHandleActivePR_ClosedMergedShrink_StampsLastShrinkOnly verifies that
+// when a shrink pull request is merged, the closed-or-merged branch stamps
+// LastShrink (the sole input to sizing's shrink-cooldown gate) and leaves
+// LastGrow untouched, in addition to clearing the lock.
+func TestHandleActivePR_ClosedMergedShrink_StampsLastShrinkOnly(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.TODO()
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = coordinationv1.AddToScheme(scheme)
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: prTestNS}}
+	quota := &corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: prTestQuota, Namespace: prTestNS}}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ns, quota).Build()
+	locker := lock.NewLeaseLocker(fakeClient)
+	g.Expect(locker.MutateState(ctx, prTestNS, prTestQuota, func(s *lock.State) {
+		s.PRID = 123
+		s.PRDirection = git.DirectionShrink
+	})).To(Succeed())
+
+	fakeGit := &FakeGitProvider{PRStatus: &git.PRStatus{IsOpen: false, IsMerged: true}}
+	r := &ResourceQuotaReconciler{
+		Client:      fakeClient,
+		Scheme:      scheme,
+		Recorder:    record.NewFakeRecorder(100),
+		GitProvider: fakeGit,
+		Locker:      locker,
+		Observer:    NewObserver(locker, time.Now),
+		BasePolicy:  sizing.DefaultPolicy(),
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: prTestQuota, Namespace: prTestNS}}
+	_, err := r.Reconcile(ctx, req)
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(lastMod.IsZero()).To(BeFalse(), "last-modified must be set after merge")
+
+	state, err := locker.GetState(ctx, prTestNS, prTestQuota)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(state.PRID).To(Equal(0), "lock must be cleared")
+	g.Expect(state.PRDirection).To(BeEmpty(), "direction must be cleared")
+	g.Expect(state.LastShrink.IsZero()).To(BeFalse(), "a merged shrink must stamp LastShrink")
+	g.Expect(state.LastGrow.IsZero()).To(BeTrue(), "a merged shrink must not also stamp LastGrow")
+}
+
+// TestHandleActivePR_ClosedUnmergedShrink_ClearsLockWithoutStamping verifies
+// that closing (not merging) a shrink pull request clears the lock but
+// records neither LastShrink nor LastGrow — nothing actually happened that
+// the cooldown gates should react to.
+func TestHandleActivePR_ClosedUnmergedShrink_ClearsLockWithoutStamping(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.TODO()
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = coordinationv1.AddToScheme(scheme)
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: prTestNS}}
+	quota := &corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: prTestQuota, Namespace: prTestNS}}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ns, quota).Build()
+	locker := lock.NewLeaseLocker(fakeClient)
+	g.Expect(locker.MutateState(ctx, prTestNS, prTestQuota, func(s *lock.State) {
+		s.PRID = 123
+		s.PRDirection = git.DirectionShrink
+	})).To(Succeed())
+
+	fakeGit := &FakeGitProvider{PRStatus: &git.PRStatus{IsOpen: false, IsMerged: false}}
+	r := &ResourceQuotaReconciler{
+		Client:      fakeClient,
+		Scheme:      scheme,
+		Recorder:    record.NewFakeRecorder(100),
+		GitProvider: fakeGit,
+		Locker:      locker,
+		Observer:    NewObserver(locker, time.Now),
+		BasePolicy:  sizing.DefaultPolicy(),
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: prTestQuota, Namespace: prTestNS}}
+	_, err := r.Reconcile(ctx, req)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	state, err := locker.GetState(ctx, prTestNS, prTestQuota)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(state.PRID).To(Equal(0), "lock must be cleared")
+	g.Expect(state.PRDirection).To(BeEmpty(), "direction must be cleared")
+	g.Expect(state.LastShrink.IsZero()).To(BeTrue(), "closing without merging must not stamp LastShrink")
+	g.Expect(state.LastGrow.IsZero()).To(BeTrue(), "closing without merging must not stamp LastGrow")
 }

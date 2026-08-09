@@ -170,18 +170,27 @@ func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.R
 		// PR is merged or closed -> Release Lock
 		logger.Info("PR is closed/merged, releasing lock", "prID", prID)
 
-		if status.IsMerged {
-			ts := time.Now()
-			logger.Info("PR merged, releasing lock and updating last-modified timestamp", "timestamp", ts)
-			if err := r.Locker.ReleaseLockWithTimestamp(ctx, req.Namespace, quota.Name, &ts); err != nil {
-				logger.Error(err, "failed to release lock")
-				return ctrl.Result{}, err
+		now := time.Now()
+		err := r.Locker.MutateState(ctx, req.Namespace, quota.Name, func(s *lock.State) {
+			// Same caveat as the auto-merge gate below: this only knows what
+			// the lease recorded, so a merged PR whose direction was never
+			// persisted there is stamped as a grow.
+			wasShrink := s.PRDirection == git.DirectionShrink
+			s.PRID = 0
+			s.PRDirection = ""
+			if !status.IsMerged {
+				return
 			}
-		} else {
-			if err := r.Locker.ReleaseLock(ctx, req.Namespace, quota.Name); err != nil {
-				logger.Error(err, "failed to release lock")
-				return ctrl.Result{}, err
+			s.LastModified = now
+			if wasShrink {
+				s.LastShrink = now
+			} else {
+				s.LastGrow = now
 			}
+		})
+		if err != nil {
+			logger.Error(err, "failed to release lock")
+			return ctrl.Result{}, err
 		}
 
 		// Requeue immediately to start fresh (check cooldown, etc.)
@@ -189,7 +198,13 @@ func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.R
 	}
 
 	// PR is open -> Check Auto-Merge
-	shouldAutoMerge := r.EnableAutoMerge
+	//
+	// Shrink pull requests are never auto-merged, regardless of the global
+	// flag or the namespace annotation: reclaiming quota is the owning team's
+	// decision, not the controller's. This gate only knows what the lease
+	// recorded, though: it trusts state.PRDirection, so a PR whose direction
+	// was never persisted there would pass through as a grow.
+	shouldAutoMerge := r.EnableAutoMerge && state.PRDirection != git.DirectionShrink
 	if val, ok := ns.Annotations[resizerConfig.AnnotationAutoMerge]; ok && val == "false" {
 		shouldAutoMerge = false
 	}
@@ -214,8 +229,15 @@ func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.R
 				// GetPRStatus call would be racy: GitHub may still report the PR as
 				// open for a short window, causing the controller to attempt a
 				// second merge on the next reconcile.
-				ts := time.Now()
-				if err := r.Locker.ReleaseLockWithTimestamp(ctx, req.Namespace, quota.Name, &ts); err != nil {
+				now := time.Now()
+				err := r.Locker.MutateState(ctx, req.Namespace, quota.Name,
+					func(s *lock.State) {
+						s.PRID = 0
+						s.PRDirection = ""
+						s.LastModified = now
+						s.LastGrow = now
+					})
+				if err != nil {
 					logger.Error(err, "failed to release lock after merge")
 					return ctrl.Result{}, err
 				}
