@@ -340,14 +340,24 @@ func TestDecide_ExtremeUsedValuesAreRejected(t *testing.T) {
 	}
 }
 
-// TestDecide_ExtremeHardIsSkipped mirrors the used-side cases for hard, but
-// picks the one residue-class example the pre-existing hardMilli==0 guard
-// would not also catch by coincidence: 2^64+1 reads back as Value()=1 (not
-// 0), so unlike 1E30 it would sail past "hardMilli == 0" and reach the
-// grow/shrink branches on a completely fabricated hard limit if
-// overflowsMilliValue did not catch it on its own.
+// TestDecide_ExtremeHardIsSkipped mirrors the used-side cases for hard, and
+// has to work harder than they do to stay meaningful — two other guards will
+// absorb a wrapped hard limit for reasons that have nothing to do with this
+// one, and a case they absorb proves nothing.
+//
+// 2^64+1 reads back as Value()=1, so it clears the hardMilli==0 guard, which
+// rules out 1E30. That leaves the quantisation guard: it compares the
+// proposed quantity against the *real* hard Quantity, and against a genuine
+// 1.8e19 every grow target loses, so any grow case is discarded before the
+// assertion can see it. A shrink is the one direction that survives — the
+// proposal is smaller than the wrapped limit and smaller than the real one —
+// so used has to be low enough to make the wrapped limit look oversized.
+// With hard reading as 1 milli-CPU, used=0.1 puts the target at 125 milli,
+// under the 850-milli shrink threshold, and the step cap lands it at 0.75.
+// Remove overflowsMilliValue and this proposes shrinking a 1.8e19 quota to
+// 750m.
 func TestDecide_ExtremeHardIsSkipped(t *testing.T) {
-	in := baseInput("18446744073709551617", "4", "4")
+	in := baseInput("18446744073709551617", "0.1", "0.1")
 
 	got := Decide(in)
 
