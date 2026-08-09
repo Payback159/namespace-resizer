@@ -3725,13 +3725,77 @@ In `CreatePR`, take the direction, use it in the title and add it as a label:
 		fmt.Sprintf("resizer/ns:%s", namespace),
 		labelDirectionPrefix + direction,
 	}
-	_, _, err = g.client.Issues.AddLabelsToIssue(ctx, g.owner, g.repo, pr.GetNumber(), labels)
-	if err != nil {
-		// A missing label is not worth failing the whole flow, but it does
-		// degrade orphan recovery, so log it at error level.
-		fmt.Printf("Failed to add labels to PR %d: %v\n", pr.GetNumber(), err)
+	if err := g.addLabels(ctx, pr.GetNumber(), labels); err != nil {
+		logger := log.FromContext(ctx)
+		if direction != DirectionShrink {
+			// A grow pull request with no label is recovered as grow anyway,
+			// so the only cost is a less precise audit trail.
+			logger.Error(err, "failed to label pull request",
+				"pr", pr.GetNumber(), "direction", direction)
+			return pr.GetNumber(), nil
+		}
+		// An unlabelled shrink is indistinguishable from a grow once this
+		// process forgets it, and grow pull requests are the ones eligible
+		// for auto-merge. Take the pull request back rather than leave a
+		// mergeable shrink behind.
+		logger.Error(err, "failed to label shrink pull request, closing it again",
+			"pr", pr.GetNumber())
+		if closeErr := g.ClosePR(ctx, pr.GetNumber(), unlabelledShrinkComment); closeErr != nil {
+			return 0, fmt.Errorf(
+				"failed to label shrink PR %d (%w) and failed to close it again: %w",
+				pr.GetNumber(), err, closeErr)
+		}
+		return 0, fmt.Errorf("failed to label shrink PR %d, closed it again: %w",
+			pr.GetNumber(), err)
 	}
 ```
+
+```go
+const unlabelledShrinkComment = "Closing this pull request: its direction " +
+	"label could not be attached, and an unlabelled shrink proposal would " +
+	"later be mistaken for a growth proposal. A replacement will be opened " +
+	"on the next reconcile."
+```
+
+The retry exists because GitHub occasionally answers with a 5xx while a
+freshly created pull request is still materialising as an issue. Closing a PR
+we cannot label is a real cost, so it should not happen for a blip. The
+backoff is a variable purely so tests need not sleep through it:
+
+```go
+// labelAttempts is how often CreatePR tries to attach the labels before it
+// treats the failure as final.
+const labelAttempts = 3
+
+// labelRetryBackoff is a variable so tests can zero it.
+var labelRetryBackoff = 500 * time.Millisecond
+
+func (g *GitHubProvider) addLabels(ctx context.Context, prNumber int, labels []string) error {
+	var err error
+	for attempt := 1; attempt <= labelAttempts; attempt++ {
+		if _, _, err = g.client.Issues.AddLabelsToIssue(
+			ctx, g.owner, g.repo, prNumber, labels); err == nil {
+			return nil
+		}
+		if attempt == labelAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("labelling PR %d cancelled: %w", prNumber, ctx.Err())
+		case <-time.After(labelRetryBackoff):
+		}
+	}
+	return fmt.Errorf("failed to label PR %d after %d attempts: %w",
+		prNumber, labelAttempts, err)
+}
+```
+
+`internal/git/github.go` has no logger today — the `fmt.Printf` this replaces
+is the only diagnostic in the whole file. Import
+`"sigs.k8s.io/controller-runtime/pkg/log"`, which `log_provider.go` in the
+same package already uses, and take the logger from the context as that file
+does.
 
 Extend `FindOpenPR` to read the label:
 
@@ -3745,17 +3809,27 @@ Extend `FindOpenPR` to read the label:
 ```
 
 ```go
-// directionFromLabels reads the direction label. Pull requests created before
-// the label existed carry none; treating them as grow preserves the previous
-// behaviour and never enables an unreviewed shrink merge.
+// directionFromLabels reads the direction label and never invents a value it
+// did not recognise.
+//
+// No direction label at all means the pull request predates the label;
+// classifying it as grow preserves the behaviour those pull requests were
+// opened under. A label that is present but is not exactly "grow" is a
+// different case: labels are writable by anyone with repository access, so an
+// unrecognised value is evidence that something other than this controller
+// wrote it. Reading it as shrink is the safe direction — shrink proposals are
+// never auto-merged, so the cost of being wrong is one human review, whereas
+// reading it as grow would cost an unreviewed merge of lowered limits.
 func directionFromLabels(labels []*github.Label) string {
 	for _, label := range labels {
 		name := label.GetName()
-		if strings.HasPrefix(name, labelDirectionPrefix) {
-			if value := strings.TrimPrefix(name, labelDirectionPrefix); value != "" {
-				return value
-			}
+		if !strings.HasPrefix(name, labelDirectionPrefix) {
+			continue
 		}
+		if strings.TrimPrefix(name, labelDirectionPrefix) == DirectionGrow {
+			return DirectionGrow
+		}
+		return DirectionShrink
 	}
 	return DirectionGrow
 }
@@ -3900,12 +3974,68 @@ When adopting an orphaned PR, persist the direction it reported:
 		})
 ```
 
-- [ ] **Step 7: Run the full suite**
+After creating a PR, persist the direction that was actually passed to
+`CreatePR` rather than the constant `grow` Task 8 left there, and stamp the
+matching timestamp:
+
+```go
+	err = r.Locker.MutateState(ctx, req.Namespace, quota.Name, func(s *lock.State) {
+		s.PRID = newPRID
+		s.PRDirection = decision.Direction.String()
+		if decision.Direction == sizing.DirectionShrink {
+			s.LastShrink = time.Now()
+		} else {
+			s.LastGrow = time.Now()
+		}
+	})
+```
+
+This is behaviour-neutral today — `handleNewProposal` is still grow-only — but
+it removes the divergence where the label on the pull request and the direction
+in the lease are written from two different sources fourteen lines apart. The
+lease is what the auto-merge gate in Task 11 reads.
+
+- [ ] **Step 7: Cover the write half of the safety boundary**
+
+Steps 1–6 test that a direction can be read back. Nothing yet asserts that the
+right direction is ever written. Add:
+
+`internal/git/github_prmgmt_test.go`
+
+- `TestCreatePR_AttachesDirectionLabel` — a shrink creation whose label
+  handler captures the request body and asserts it contains
+  `resizer/direction:shrink`, plus a grow case asserting
+  `resizer/direction:grow`. The existing `TestCreatePR` label handler asserts
+  nothing; this is the assertion it is missing.
+- `TestCreatePR_ShrinkClosesItselfWhenLabellingFails` — label endpoint always
+  answers 500, close endpoint records the call. Set `labelRetryBackoff = 0`
+  for the test (restore it with `t.Cleanup`). Assert: `labelAttempts` label
+  requests were made, the PR was commented on and closed, and `CreatePR`
+  returned an error with PR id 0.
+- `TestCreatePR_GrowSurvivesLabellingFailure` — same 500, direction grow.
+  Assert: no close call, `CreatePR` returns the PR number and no error.
+- `TestFindOpenPR_UnknownDirectionReadsAsShrink` — label
+  `resizer/direction:Shrink` (wrong case) and a second case with
+  `resizer/direction:banana`; both must yield `git.DirectionShrink`.
+
+`internal/controller/` — the adoption test added in Step 6 asserts only the PR
+id. Extend it to assert the persisted `PRDirection` equals the direction the
+fake reported, using `FakeGitProvider.ExistingPRDirection`. Add a case where
+the fake reports `git.DirectionShrink` and assert the lease records shrink,
+not grow — without it, the hardcoded-grow defect this task removes would still
+pass every test.
+
+`FakeGitProvider.ClosedPRID`, `ClosedComment` and `ClosePRCalls` are added in
+Step 4; if no test in this task reads them, they are dead fields — the shrink
+tests above are their first consumer at the `git` level, and Task 12 is the
+first at the controller level.
+
+- [ ] **Step 8: Run the full suite**
 
 Run: `make test`
 Expected: PASS.
 
-- [ ] **Step 8: Lint and commit**
+- [ ] **Step 9: Lint and commit**
 
 ```bash
 make lint
@@ -4418,7 +4548,9 @@ double the wait:
 	}
 ```
 
-and record the direction-specific timestamp after creation:
+The direction-specific timestamp after creation is **already in place** — Task
+10 moved this block forward to keep the pull request label and the lease from
+being written from two different sources:
 
 ```go
 	err = r.Locker.MutateState(ctx, req.Namespace, quota.Name, func(s *lock.State) {
@@ -4431,6 +4563,9 @@ and record the direction-specific timestamp after creation:
 		}
 	})
 ```
+
+Verify it reads exactly like this and move on; do not add a second
+`MutateState` call.
 
 - [ ] **Step 6: Run the full suite**
 
