@@ -8,6 +8,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
+// maxMilliValue (the largest Quantity.Value() that MilliValue() can convert
+// without wrapping) is defined in decide.go, alongside the empirical
+// measurements behind it.
+
 // WindowVersion is the schema version of the persisted observation window.
 // A window carrying any other value is discarded and rebuilt from scratch.
 const WindowVersion = 1
@@ -59,7 +63,31 @@ func DecodeWindow(raw string) Window {
 	if w.Version != WindowVersion {
 		return Window{Version: WindowVersion}
 	}
+	if hasDuplicateDates(w.Days) {
+		// IsComplete indexes days keeping the last bucket per date; Observe's
+		// indexOf keeps updating the first. A window that somehow ended up
+		// with two buckets for the same date would let the two disagree
+		// about which bucket is authoritative — in the direction that can
+		// only hide an uncovered day, never invent one, since the two
+		// candidate buckets were both written by the same trusted path.
+		// Treat it the same as any other corrupt window: discard and
+		// rebuild, rather than risk reading the wrong one.
+		return Window{Version: WindowVersion}
+	}
 	return w
+}
+
+// hasDuplicateDates reports whether any date appears more than once, which
+// should never happen on a window this package wrote itself.
+func hasDuplicateDates(days []DayBucket) bool {
+	seen := make(map[string]bool, len(days))
+	for _, bucket := range days {
+		if seen[bucket.Date] {
+			return true
+		}
+		seen[bucket.Date] = true
+	}
+	return false
 }
 
 // EncodeWindow serialises a window for storage in a Lease annotation.
@@ -161,6 +189,13 @@ func (w Window) Peak(res corev1.ResourceName, now time.Time, windowDays int) (in
 		}
 		qty, err := resource.ParseQuantity(raw)
 		if err != nil {
+			continue
+		}
+		if qty.Value() > maxMilliValue {
+			// MilliValue() would wrap above this size; a wrapped historical
+			// peak could read as huge-negative and mask real usage, or as
+			// small-positive and understate it — either way it must not
+			// enter the max() below.
 			continue
 		}
 		if milli := qty.MilliValue(); !found || milli > best {

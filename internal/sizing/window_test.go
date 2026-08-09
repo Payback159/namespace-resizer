@@ -55,6 +55,17 @@ func TestDecodeWindow_Tolerant(t *testing.T) {
 		{name: "empty", raw: ""},
 		{name: "not json", raw: "{{{"},
 		{name: "unknown version", raw: `{"v":99,"days":[{"d":"2026-08-01"}]}`},
+		{
+			name: "duplicate date",
+			// IsComplete keeps the last bucket per date, Observe keeps
+			// updating the first — a window with two buckets for the same
+			// date must be treated as corrupt, the same as an unparseable
+			// one, rather than let the two disagree about which is real.
+			raw: `{"v":1,"days":[` +
+				`{"d":"2026-08-01","p":{"requests.cpu":"1"}},` +
+				`{"d":"2026-08-01","p":{"requests.cpu":"2"}}` +
+				`]}`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -82,6 +93,55 @@ func TestWindow_PeakAcrossCompletedDays(t *testing.T) {
 	}
 	if peak != 4000 {
 		t.Fatalf("peak = %d milli, want 4000 (current day excluded)", peak)
+	}
+}
+
+func TestWindow_Peak_SkipsOverflowingBucketButKeepsOthers(t *testing.T) {
+	// Quantity.MilliValue() wraps above roughly 8 PiB (see decide.go for the
+	// empirical measurements). A historical bucket carrying such a value
+	// must not enter the peak as a wrapped, possibly negative, number — but
+	// a real value on another day must still count.
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	w := Window{
+		Version: WindowVersion,
+		Days: []DayBucket{
+			{
+				Date:  now.UTC().AddDate(0, 0, -1).Format(dateLayout),
+				Peaks: map[string]string{"requests.storage": "16Pi"},
+			},
+			{
+				Date:  now.UTC().AddDate(0, 0, -2).Format(dateLayout),
+				Peaks: map[string]string{"requests.storage": "3Pi"},
+			},
+		},
+	}
+
+	peak, ok := w.Peak(corev1.ResourceRequestsStorage, now, 14)
+
+	if !ok {
+		t.Fatal("Peak reported no data, want the 3Pi day")
+	}
+	wantQty := resource.MustParse("3Pi")
+	want := wantQty.MilliValue()
+	if peak != want {
+		t.Fatalf("peak = %d, want %d (3Pi; the 16Pi day must be skipped, not wrapped)", peak, want)
+	}
+}
+
+func TestWindow_Peak_AllBucketsOverflowingYieldsNoData(t *testing.T) {
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	w := Window{
+		Version: WindowVersion,
+		Days: []DayBucket{
+			{
+				Date:  now.UTC().AddDate(0, 0, -1).Format(dateLayout),
+				Peaks: map[string]string{"requests.storage": "16Pi"},
+			},
+		},
+	}
+
+	if peak, ok := w.Peak(corev1.ResourceRequestsStorage, now, 14); ok {
+		t.Fatalf("Peak = %d, ok = true; want no usable data from an unmeasurable value", peak)
 	}
 }
 

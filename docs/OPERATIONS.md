@@ -78,7 +78,7 @@ Ein Rückbau ist deutlich vorsichtiger abgesichert als ein Grow. Alle vier Gates
 Zwei Effekte, die dabei auf den ersten Blick überraschen, aber korrekt sind:
 
 *   Wird ein Shrink-PR von einem Menschen abgelehnt (PR ohne Merge geschlossen), setzt der Controller `resizer.io/last-shrink` auf jetzt. `resizer_shrink_blocked_by{gate="cooldown"}` steht danach für die volle Shrink-Cooldown-Dauer auf `1` — das ist kein hängender Gauge, sondern die Ablehnung, die respektiert wird.
-*   Solange ein Gate einen Shrink blockiert, melden `resizer_quota_target` und `resizer_quota_waste_ratio` trotzdem den blockierten Shrink-Zielwert weiter (die Dry-Run-Vorschau wird auch bei blockierendem Gate befüllt). Das ist kein Fehler, sondern genau das, was den Dry-Run-Rollout in Abschnitt 7 überhaupt beobachtbar macht.
+*   Solange ein Gate einen Shrink blockiert, melden `resizer_quota_target` und `resizer_quota_waste_ratio` trotzdem das unbegrenzte Ziel weiter — dieselbe Zahl, die jede ausgewertete Ressource bekommt, unabhängig davon, ob daraus ein gedeckelter Shrink, ein Grow oder gar keine Aktion wird. Das ist kein Fehler, sondern genau das, was den Dry-Run-Rollout in Abschnitt 7 überhaupt beobachtbar macht.
 
 ### E. Weitere Sicherheitsgarantien
 
@@ -132,8 +132,8 @@ metadata:
 
 Der Controller exposiert Prometheus-Metriken, wenn das `--metrics-bind-address` Flag gesetzt ist (z.B. `:8443`). Diese Metriken sind für die Beobachtung des Shrink-Pfads (insbesondere im Flag-Off-Rollout) **essentiell**:
 
-*   **`resizer_quota_target`**: Das berechnete Ziel für jede Quota-Ressource (in Milli-Einheiten). Wird auch für einen von einem Gate blockierten Shrink weiter gemeldet (siehe 4.D).
-*   **`resizer_quota_waste_ratio`**: Verhältnis von aktuellem Hard-Limit zu berechnetem Ziel. Ein Wert nahe `1` heißt, das Quota folgt dem Bedarf bereits eng; ein Wert deutlich über `1` markiert Überdimensionierung.
+*   **`resizer_quota_target`**: Das unbegrenzte, aus Abschnitt 3 berechnete Ziel für jede Quota-Ressource (in Milli-Einheiten) — nicht der auf einen Schritt gedeckelte Wert, der tatsächlich per PR vorgeschlagen wird (`max-shrink-step`). Wird für jede vom Controller ausgewertete Ressource gemeldet, auch für eine, die gerade innerhalb des Toleranzbands liegt oder deren Shrink von einem Gate blockiert wird (siehe 4.D).
+*   **`resizer_quota_waste_ratio`**: Verhältnis von aktuellem Hard-Limit zu diesem unbegrenzten Ziel — nicht zum gedeckelten Shrink-Kandidaten. Damit unterscheidet der Wert zuverlässig eine 4-fach von einer 40-fach überdimensionierten Quota; gegen den gedeckelten Kandidaten würden beide am selben Wert sättigen (`hard / (hard × 0,75) ≈ 1,33`). Ein Wert nahe `1` heißt, das Quota folgt dem Bedarf bereits eng; ein Wert deutlich über `1` markiert Überdimensionierung.
 *   **`resizer_shrink_blocked_by{gate}`**: Welches Gate (`enabled`, `window`, `recent-grow`, `cooldown`) eine Shrink-Operation derzeit blockiert (1 = blockiert, 0 = nicht blockiert). Bleibt nach einer abgelehnten PR erwartungsgemäß für die volle Cooldown-Dauer bei `cooldown=1` stehen (siehe 4.D).
 *   **`resizer_decision_total`**: Zähler der Sizing-Decisions pro Richtung (`grow`/`shrink`/`none`).
 
@@ -144,7 +144,7 @@ Das Feature schaltet Shrink standardmäßig **aus**: `--enable-shrink` ist per D
 Empfohlener Ablauf, um das Flag guten Gewissens zu aktivieren:
 
 1.  Deploye ohne `--enable-shrink` und mit gesetztem `--metrics-bind-address=:8443`, damit die Metriken verfügbar sind.
-2.  Beobachte `resizer_quota_waste_ratio` über mindestens ein volles Beobachtungsfenster (14 Tage, Default). Ein Wert nahe `1` heißt, das Quota trackt den Bedarf bereits; ein Wert über `2` markiert einen Namespace, der sich für einen Rückbau lohnt.
+2.  Beobachte `resizer_quota_waste_ratio` über mindestens ein volles Beobachtungsfenster (14 Tage, Default). Der Wert ist gegen das unbegrenzte Ziel gerechnet, nicht gegen den 25-%-Schritt-Deckel eines einzelnen Shrink-PRs, und bleibt deshalb über den gesamten Bereich der Überdimensionierung aussagekräftig. Ein Wert nahe `1` heißt, das Quota trackt den Bedarf bereits; ein Wert über `2` markiert einen Namespace, der sich für einen Rückbau lohnt — auch einen, der erst über mehrere schrittweise PRs zurückgebaut wird (siehe Abschnitt 3.4 im Design-Dokument).
 3.  Prüfe `resizer_shrink_blocked_by{gate="window"}`. Bleibt der Wert dauerhaft bei `1`, wird der Controller zu häufig neu gestartet, als dass ein Fenster vollständig würde — das zuerst beheben, bevor Shrink aktiviert wird.
 4.  Aktiviere `--enable-shrink`. Die ersten Shrink-PRs sind innerhalb eines Tages zu erwarten, höchstens einer pro Quota, jeweils auf maximal 25 % Reduktion gedeckelt.
 5.  Um einzelne Namespaces auszunehmen, annotiere sie mit `resizer.io/shrink-enabled: "false"` — das funktioniert unabhängig vom globalen Flag-Zustand und bleibt auch nach dessen Aktivierung bestehen (siehe [INSTALLATION.md](INSTALLATION.md)).

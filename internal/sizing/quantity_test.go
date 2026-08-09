@@ -89,8 +89,14 @@ func TestQuantize(t *testing.T) {
 func TestIsCountable(t *testing.T) {
 	countable := []corev1.ResourceName{
 		corev1.ResourcePods,
+		corev1.ResourceServices,
+		corev1.ResourceReplicationControllers,
+		corev1.ResourceQuotas,
 		corev1.ResourceSecrets,
+		corev1.ResourceConfigMaps,
 		corev1.ResourcePersistentVolumeClaims,
+		corev1.ResourceServicesNodePorts,
+		corev1.ResourceServicesLoadBalancers,
 		corev1.ResourceName("count/jobs.batch"),
 		corev1.ResourceName("count/csistoragecapacities.storage.k8s.io"),
 		corev1.ResourceName("gold.storageclass.storage.k8s.io/persistentvolumeclaims"),

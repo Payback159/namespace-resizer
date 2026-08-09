@@ -54,9 +54,13 @@ func init() {
 		quotaTarget, quotaWasteRatio, shrinkBlockedBy, decisionTotal)
 }
 
-// recordDecision publishes one evaluation. It reports the shrink preview as
-// well as the acted-on targets, so the waste is visible while the shrink path
-// is still switched off.
+// recordDecision publishes one evaluation. quotaTarget and quotaWasteRatio
+// are built on decision.RawTargets — the uncapped target from spec 3, not
+// Targets/ShrinkPreview — so a namespace stays rankable by waste across its
+// full range instead of saturating at the per-PR step cap. Published for
+// every resource Decide evaluated, including one sitting inside the
+// tolerance band, so "waste ratio near 1" is observable as documented rather
+// than only ever appearing right at the grow/shrink trigger points.
 func recordDecision(
 	namespace, quota string,
 	hard corev1.ResourceList,
@@ -64,20 +68,16 @@ func recordDecision(
 ) {
 	decisionTotal.WithLabelValues(namespace, quota, decision.Direction.String()).Inc()
 
-	targets := decision.Targets
-	if len(targets) == 0 {
-		targets = decision.ShrinkPreview
-	}
-
 	// Iterate the quota's own keys, not the targets, so a resource that no
-	// longer needs one has its series removed instead of left behind. A gauge
-	// frozen at its last value would keep reporting waste that has already
-	// been resolved — the mirror image of the stale gate this function is
-	// careful to avoid below.
+	// longer has one — dropped from the quota, no matching Used entry, or
+	// unmeasurable (see sizing.Decide's overflow guard) — has its series
+	// removed instead of left behind. A gauge frozen at its last value would
+	// keep reporting waste that has already been resolved — the mirror image
+	// of the stale gate this function is careful to avoid below.
 	for res, current := range hard {
 		labels := []string{namespace, quota, string(res)}
 
-		target, wanted := targets[res]
+		target, wanted := decision.RawTargets[res]
 		targetMilli := target.MilliValue()
 		if !wanted || targetMilli == 0 {
 			quotaTarget.DeleteLabelValues(labels...)

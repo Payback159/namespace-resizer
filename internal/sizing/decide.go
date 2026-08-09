@@ -2,6 +2,7 @@ package sizing
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -9,6 +10,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
+
+// maxMilliValue is the largest Value() a Quantity can carry without its
+// MilliValue() wrapping instead of clamping. Verified empirically against
+// the pinned k8s.io/apimachinery v0.36.1: AsScaledInt64 discards the ok flag
+// from a scale conversion that overflows int64, so ScaledValue silently
+// returns a wrapped (and possibly negative) product above this threshold.
+const maxMilliValue = math.MaxInt64 / 1000
 
 // Direction is the kind of change a Decision asks for.
 type Direction int
@@ -73,8 +81,16 @@ type Decision struct {
 	// controller would do while shrinking is still switched off. Never act on
 	// it — only Targets is authoritative.
 	ShrinkPreview map[corev1.ResourceName]resource.Quantity
-	Reason        string
-	BlockedBy     []Gate
+	// RawTargets is the uncapped target for every resource Decide evaluated,
+	// independent of the per-PR step cap and the tolerance band. It exists to
+	// drive resizer_quota_target/resizer_quota_waste_ratio (see
+	// controller/metrics.go): a step-capped shrink candidate saturates at
+	// hard * (1 - max-shrink-step) and cannot tell a 4x oversized namespace
+	// from a 40x one, but the uncapped target can. Never act on it for a pull
+	// request — Targets/ShrinkPreview stay authoritative there.
+	RawTargets map[corev1.ResourceName]resource.Quantity
+	Reason     string
+	BlockedBy  []Gate
 }
 
 // Decide computes the target for every quota key and folds the per-resource
@@ -88,9 +104,15 @@ func Decide(in Input) Decision {
 
 	growTargets := map[corev1.ResourceName]resource.Quantity{}
 	shrinkTargets := map[corev1.ResourceName]resource.Quantity{}
+	rawTargets := map[corev1.ResourceName]resource.Quantity{}
 	var growReasons, shrinkReasons []string
 
 	for res, hard := range in.Hard {
+		if hard.Value() > maxMilliValue {
+			// hard.MilliValue() would wrap (not clamp) above this size; treat
+			// the resource as unmeasurable rather than act on garbage.
+			continue
+		}
 		hardMilli := hard.MilliValue()
 		if hardMilli == 0 {
 			continue
@@ -100,10 +122,18 @@ func Decide(in Input) Decision {
 		if !ok {
 			continue
 		}
+		if used.Value() > maxMilliValue {
+			continue
+		}
 		usedMilli := used.MilliValue()
 
 		headroom := in.Policy.HeadroomFor(res)
 		targetMilli, driver := targetFor(in, res, usedMilli, headroom)
+
+		// Recorded before the step cap and the tolerance band below touch
+		// targetMilli, so it stays the uncapped target described on
+		// RawTargets — the metrics need it; PR proposals do not.
+		rawTargets[res] = Quantize(res, targetMilli, hard.Format)
 
 		switch {
 		case float64(targetMilli) > float64(hardMilli)*(1+in.Policy.Tolerance):
@@ -136,14 +166,15 @@ func Decide(in Input) Decision {
 	if len(growTargets) > 0 {
 		sort.Strings(growReasons)
 		return Decision{
-			Direction: DirectionGrow,
-			Targets:   growTargets,
-			Reason:    strings.Join(growReasons, "\n"),
+			Direction:  DirectionGrow,
+			Targets:    growTargets,
+			Reason:     strings.Join(growReasons, "\n"),
+			RawTargets: rawTargets,
 		}
 	}
 
 	if len(shrinkTargets) == 0 {
-		return Decision{Direction: DirectionNone}
+		return Decision{Direction: DirectionNone, RawTargets: rawTargets}
 	}
 
 	if blocked := shrinkGates(in, shrinkTargets); len(blocked) > 0 {
@@ -151,6 +182,7 @@ func Decide(in Input) Decision {
 			Direction:     DirectionNone,
 			ShrinkPreview: shrinkTargets,
 			BlockedBy:     blocked,
+			RawTargets:    rawTargets,
 		}
 	}
 
@@ -160,6 +192,7 @@ func Decide(in Input) Decision {
 		Targets:       shrinkTargets,
 		ShrinkPreview: shrinkTargets,
 		Reason:        strings.Join(shrinkReasons, "\n"),
+		RawTargets:    rawTargets,
 	}
 }
 
@@ -191,8 +224,8 @@ func targetFor(
 		target = lowerBound
 		driver = "current usage floor"
 	}
-	if min, ok := in.Policy.MinFor(res); ok && min.MilliValue() > target {
-		target = min.MilliValue()
+	if floor, ok := in.Policy.MinFor(res); ok && floor.MilliValue() > target {
+		target = floor.MilliValue()
 		driver = "configured minimum"
 	}
 

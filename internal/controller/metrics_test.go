@@ -3,6 +3,7 @@ package controller
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/payback159/namespace-resizer/internal/sizing"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -10,28 +11,59 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
+// fullyCoveredWindow samples once every 5 minutes across windowDays
+// completed days ending yesterday, so every shrink gate but the one a test
+// deliberately breaks passes.
+func fullyCoveredWindow(now time.Time, windowDays int, cpu string) sizing.Window {
+	w := sizing.Window{Version: sizing.WindowVersion}
+	start := now.UTC().AddDate(0, 0, -windowDays).Truncate(24 * time.Hour)
+	used := corev1.ResourceList{corev1.ResourceRequestsCPU: resource.MustParse(cpu)}
+	for t := start; t.Before(now.UTC().Truncate(24 * time.Hour)); t = t.Add(5 * time.Minute) {
+		w.Observe(t, "test-uid", used, windowDays)
+	}
+	return w
+}
+
 func TestRecordDecision_ExposesWasteRatio(t *testing.T) {
 	quotaTarget.Reset()
 	quotaWasteRatio.Reset()
 	shrinkBlockedBy.Reset()
 
+	// hard 16, peak 4, used 3.5: Decide's real formula puts the uncapped
+	// target at 4 * 1.25 = 5, but the per-PR step cap only allows a drop to
+	// hard * 0.75 = 12 (see decide_test.go's TestDecide_ShrinkIsStepCapped,
+	// same inputs). Shrinking is switched off here so the gate lets us
+	// assert on decision.RawTargets — the shrink preview alone — without the
+	// step-capped Targets/ShrinkPreview values leaking into the metric.
+	policy := sizing.DefaultPolicy()
+	policy.ShrinkEnabled = false
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+
 	hard := corev1.ResourceList{
 		corev1.ResourceRequestsCPU: resource.MustParse("16"),
 	}
-	decision := sizing.Decision{
-		Direction: sizing.DirectionNone,
-		ShrinkPreview: map[corev1.ResourceName]resource.Quantity{
-			corev1.ResourceRequestsCPU: resource.MustParse("4"),
-		},
-		BlockedBy: []sizing.Gate{sizing.GateEnabled},
+	decision := sizing.Decide(sizing.Input{
+		Now:    now,
+		Hard:   hard,
+		Used:   corev1.ResourceList{corev1.ResourceRequestsCPU: resource.MustParse("3500m")},
+		Window: fullyCoveredWindow(now, policy.WindowDays, "4"),
+		Policy: policy,
+	})
+
+	if decision.Direction != sizing.DirectionNone {
+		t.Fatalf("direction = %v, want none (shrink blocked by the enabled gate)", decision.Direction)
 	}
 
 	recordDecision("team-a", "compute", hard, decision)
 
+	// 16 / 5 = 3.2, not 16 / 12 = 1.333: the waste ratio has to be built on
+	// the uncapped target so a 4x oversized namespace stays distinguishable
+	// from one that is 40x oversized instead of both saturating at the step
+	// cap.
 	expected := `
 # HELP resizer_quota_waste_ratio Current hard limit divided by the computed target.
 # TYPE resizer_quota_waste_ratio gauge
-resizer_quota_waste_ratio{namespace="team-a",quota="compute",resource="requests.cpu"} 4
+resizer_quota_waste_ratio{namespace="team-a",quota="compute",resource="requests.cpu"} 3.2
 `
 	err := testutil.CollectAndCompare(
 		quotaWasteRatio, strings.NewReader(expected), "resizer_quota_waste_ratio")
@@ -70,6 +102,9 @@ func TestRecordDecision_ClearsStaleGates(t *testing.T) {
 		Targets: map[corev1.ResourceName]resource.Quantity{
 			corev1.ResourceRequestsCPU: resource.MustParse("20"),
 		},
+		RawTargets: map[corev1.ResourceName]resource.Quantity{
+			corev1.ResourceRequestsCPU: resource.MustParse("20"),
+		},
 	})
 
 	got := testutil.ToFloat64(shrinkBlockedBy.WithLabelValues(
@@ -90,6 +125,9 @@ func TestRecordDecision_ClearsResolvedTargets(t *testing.T) {
 	recordDecision("team-a", "compute", hard, sizing.Decision{
 		Direction: sizing.DirectionNone,
 		ShrinkPreview: map[corev1.ResourceName]resource.Quantity{
+			corev1.ResourceRequestsCPU: resource.MustParse("4"),
+		},
+		RawTargets: map[corev1.ResourceName]resource.Quantity{
 			corev1.ResourceRequestsCPU: resource.MustParse("4"),
 		},
 		BlockedBy: []sizing.Gate{sizing.GateEnabled},

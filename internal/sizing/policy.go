@@ -71,14 +71,32 @@ func (p Policy) HeadroomFor(res corev1.ResourceName) float64 {
 	return 0.25
 }
 
-// MinFor returns the configured absolute lower bound for a quota key.
+// MinFor returns the configured absolute lower bound for a quota key: exact
+// match first, then the resource family (cpu/memory/storage), same as
+// HeadroomFor. An absolute minimum configured as e.g. resizer.io/cpu-min is
+// safe to share across requests.cpu and limits.cpu — it is the annotation
+// name the docs give as the example, and it never matches a quota key
+// exactly.
 func (p Policy) MinFor(res corev1.ResourceName) (resource.Quantity, bool) {
-	q, ok := p.Min[res]
-	return q, ok
+	if q, ok := p.Min[res]; ok {
+		return q, true
+	}
+	if family, ok := resourceFamily(res); ok {
+		if q, ok := p.Min[family]; ok {
+			return q, true
+		}
+	}
+	return resource.Quantity{}, false
 }
 
+// resourceFamily classifies a quota key by what it measures, not by its
+// full name. measureOf strips any scope prefix first so a storage-class
+// scoped claim count such as
+// "gold.storageclass.storage.k8s.io/persistentvolumeclaims" — whose scope
+// contains the word "storage" while the key itself counts claims — is not
+// mistaken for the storage family.
 func resourceFamily(res corev1.ResourceName) (corev1.ResourceName, bool) {
-	name := string(res)
+	name := measureOf(res)
 	switch {
 	case strings.Contains(name, "cpu"):
 		return corev1.ResourceCPU, true
@@ -92,43 +110,69 @@ func resourceFamily(res corev1.ResourceName) (corev1.ResourceName, bool) {
 
 // parseScalar applies one non-headroom, non-increment, non-threshold
 // annotation and returns a warning string, empty when there is nothing to
-// say.
+// say. A value that fails to parse or falls outside the annotation's valid
+// range is rejected: the field keeps its current value (the default, unless
+// a global flag already set it) and the rejection is reported as a warning
+// rather than silently dropped, so a plausible-looking typo does not read
+// to the operator as "no annotation was written".
 func parseScalar(name, value string, out *Policy) string {
 	switch {
 	case strings.HasSuffix(name, "-min"):
 		if q, err := resource.ParseQuantity(value); err == nil {
 			out.Min[corev1.ResourceName(strings.TrimSuffix(name, "-min"))] = q
+			return ""
 		}
+		return rejectionWarning(name, value, "must be a valid resource quantity")
 	case name == "tolerance":
-		if v, ok := parseFraction(value); ok {
+		if v, ok := parseFraction(value); ok && v >= 0 && v < 1 {
 			out.Tolerance = v
+			return ""
 		}
+		return rejectionWarning(name, value, "must be a fraction in [0, 1), e.g. \"0.15\" or \"15%\"")
 	case name == "max-shrink-step":
-		if v, ok := parseFraction(value); ok {
+		if v, ok := parseFraction(value); ok && v > 0 && v < 1 {
 			out.MaxShrinkStep = v
+			return ""
 		}
+		return rejectionWarning(name, value, "must be a fraction in (0, 1), e.g. \"0.25\" or \"25%\"")
 	case name == "window-days":
 		if v, err := strconv.Atoi(value); err == nil && v > 0 {
 			out.WindowDays = v
+			return ""
 		}
+		return rejectionWarning(name, value, "must be a positive integer")
 	case name == "shrink-cooldown-days":
 		if v, err := strconv.Atoi(value); err == nil && v >= 0 {
 			out.ShrinkCooldown = time.Duration(v) * 24 * time.Hour
+			return ""
 		}
+		return rejectionWarning(name, value, "must be a non-negative integer")
 	case name == "shrink-pr-ttl-days":
 		if v, err := strconv.Atoi(value); err == nil && v > 0 {
 			out.ShrinkPRTTL = time.Duration(v) * 24 * time.Hour
+			return ""
 		}
+		return rejectionWarning(name, value, "must be a positive integer")
 	case name == "cooldown-minutes":
 		if v, err := strconv.Atoi(value); err == nil && v >= 0 {
 			out.GrowCooldown = time.Duration(v) * time.Minute
+			return ""
 		}
+		return rejectionWarning(name, value, "must be a non-negative integer")
 	case name == "enabled":
 		out.Enabled = value != falseValue
 	case name == "shrink-enabled":
 		return parseShrinkOptOut(value, out)
 	}
 	return ""
+}
+
+// rejectionWarning reports an annotation value that failed validation. The
+// field it targeted keeps whatever it already held.
+func rejectionWarning(name, value, requirement string) string {
+	return fmt.Sprintf(
+		"annotation %s%s has the invalid value %q, so it is ignored and the previous value is kept (%s)",
+		AnnotationPrefix, name, value, requirement)
 }
 
 // parseShrinkOptOut applies the shrink-enabled annotation, which is opt-out
@@ -178,16 +222,25 @@ func ParsePolicy(annotations map[string]string, base Policy) (Policy, []string) 
 
 		switch {
 		case strings.HasSuffix(name, "headroom"):
-			if v, ok := parseFraction(value); ok {
+			if v, ok := parseFraction(value); ok && v >= 0 {
 				fromHeadroom[suffixKey(name, "headroom")] = v
+			} else {
+				warnings = append(warnings, rejectionWarning(name, value,
+					"must be a fraction >= 0, e.g. \"0.25\" or \"25%\""))
 			}
 		case strings.HasSuffix(name, "increment"):
-			if v, ok := parseFraction(value); ok {
+			if v, ok := parseFraction(value); ok && v >= 0 {
 				fromIncrement[suffixKey(name, "increment")] = v
+			} else {
+				warnings = append(warnings, rejectionWarning(name, value,
+					"must be a fraction >= 0, e.g. \"0.2\" or \"20%\""))
 			}
 		case strings.HasSuffix(name, "threshold"):
-			if v, err := strconv.ParseFloat(value, 64); err == nil && v > 0 {
+			if v, err := strconv.ParseFloat(value, 64); err == nil && v > 0 && v <= 100 {
 				fromThreshold[suffixKey(name, "threshold")] = 100.0/v - 1.0
+			} else {
+				warnings = append(warnings, rejectionWarning(name, value,
+					"must be a percentage in (0, 100]"))
 			}
 		default:
 			if w := parseScalar(name, value, &out); w != "" {
