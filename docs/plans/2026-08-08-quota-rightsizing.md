@@ -5030,20 +5030,21 @@ Expected: PASS. This requires a Kind cluster; the target creates one.
 Replace section 2.2's note (currently at `docs/ARCHITECTURE.md:38`):
 
 ```markdown
-*Hinweis:* Es gibt kein festes `MaxAllowedLimit` pro Namespace — nicht, um
-unbegrenztes Wachstum zu erlauben, sondern weil der beobachtete Bedarf selbst
-die Obergrenze bildet. Das Limit folgt dem Bedarf in beide Richtungen.
+*Note:* there is no fixed `MaxAllowedLimit` per namespace — not in order to
+permit unbounded growth, but because observed demand is itself the upper
+bound. The limit follows demand in both directions.
 ```
 
 Replace the calculation model in the same section:
 
 ```markdown
-**Berechnungs-Modell:**
+**Calculation model:**
 
-$$ \text{Target} = \max(\text{Peak}_{\text{Fenster}}, \text{Used}) \times (1 + \text{Headroom}) $$
+$$ \text{Target} = \max(\text{Peak}_{\text{window}}, \text{Used}) \times (1 + \text{Headroom}) $$
 
-Gehandelt wird nur außerhalb eines Toleranzbands um diesen Zielwert. Details,
-Guardrails und Rollout: [Design-Dokument](design/2026-08-08-quota-rightsizing.md).
+Action is taken only outside a tolerance band around this target. For details,
+guardrails and rollout, see the
+[design document](design/2026-08-08-quota-rightsizing.md).
 ```
 
 Delete section 2.4's claim that the cooldown is the only guardrail, and list
