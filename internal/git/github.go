@@ -64,6 +64,9 @@ type PRStatus struct {
 	MergeableState   string
 	ChecksState      string
 	ChecksTotalCount int
+	// CreatedAt is when the pull request was opened. The shrink TTL is
+	// measured against it.
+	CreatedAt time.Time
 }
 
 type GitHubProvider struct {
@@ -162,6 +165,7 @@ func (g *GitHubProvider) GetPRStatus(ctx context.Context, prID int) (*PRStatus, 
 		MergeableState:   pr.GetMergeableState(),
 		ChecksState:      checksState,
 		ChecksTotalCount: checksTotalCount,
+		CreatedAt:        pr.GetCreatedAt().Time,
 	}, nil
 }
 

@@ -100,15 +100,9 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	deficits, err := r.collectDeficits(ctx, quota, state.LastModified)
-	deficitScanFailed := err != nil
 	if err != nil {
 		// A failed event scan must not stop the metric-driven path; it only
 		// means a pending shortage may be reacted to one reconcile later.
-		//
-		// It is not symmetric, though: a missing deficit can only lower the
-		// target, so a failed scan could tip a quota from "no action" into
-		// "shrink". The shrink branch below therefore requires a successful
-		// scan.
 		logger.Error(err, "failed to collect event deficits")
 	}
 
@@ -130,32 +124,18 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		"blockedBy", decision.BlockedBy)
 
 	if state.PRID != 0 {
-		return r.handleActivePR(ctx, req, quota, ns, state, decision)
+		return r.handleActivePR(ctx, req, quota, ns, policy, state, decision)
 	}
 
-	if decision.Direction == sizing.DirectionGrow {
+	if decision.Direction != sizing.DirectionNone {
 		return r.handleNewProposal(ctx, req, quota, ns, policy, state, decision)
-	}
-
-	if decision.Direction == sizing.DirectionShrink {
-		// Shrink PRs are wired up in the shrink-PR task. Until then the
-		// decision is observable through metrics only. deficitScanFailed is
-		// already checked here so the guard exists before the shrink branch
-		// becomes actionable.
-		if deficitScanFailed {
-			logger.Info("Shrink suppressed: the event scan failed, so the " +
-				"target may be understated")
-		} else {
-			logger.Info("Shrink recommended but not yet actionable",
-				"targets", decision.Targets)
-		}
 	}
 
 	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 }
 
 // handleActivePR manages the lifecycle of an existing Pull Request
-func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.Request, quota corev1.ResourceQuota, ns corev1.Namespace, state lock.State, decision sizing.Decision) (ctrl.Result, error) {
+func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.Request, quota corev1.ResourceQuota, ns corev1.Namespace, policy sizing.Policy, state lock.State, decision sizing.Decision) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	prID := state.PRID
 	logger.Info("Lock found, checking PR status", "prID", prID)
@@ -195,6 +175,30 @@ func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.R
 
 		// Requeue immediately to start fresh (check cooldown, etc.)
 		return ctrl.Result{Requeue: true}, nil
+	}
+
+	if state.PRDirection == git.DirectionShrink {
+		if reason, expire := shrinkPRShouldClose(policy, status, decision); expire {
+			logger.Info("Closing shrink PR", "prID", state.PRID, "reason", reason)
+			if err := r.GitProvider.ClosePR(ctx, state.PRID, reason); err != nil {
+				logger.Error(err, "failed to close shrink PR", "prID", state.PRID)
+				return ctrl.Result{}, err
+			}
+			// Recording the shrink timestamp is what stops the very next
+			// reconcile from opening the same PR again.
+			now := time.Now()
+			err := r.Locker.MutateState(ctx, req.Namespace, quota.Name,
+				func(s *lock.State) {
+					s.PRID = 0
+					s.PRDirection = ""
+					s.LastShrink = now
+				})
+			if err != nil {
+				logger.Error(err, "failed to release lock after closing shrink PR")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
 	}
 
 	// PR is open -> Check Auto-Merge
@@ -256,11 +260,11 @@ func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.R
 	// Update PR if recommendations changed. Only a grow decision may rewrite
 	// the PR: a shrink decision reaching this point would otherwise lower the
 	// limits on an open grow PR, which the auto-merge block above could then
-	// merge — breaking the rule that a shrink is never auto-merged, before
-	// shrink pull requests are even supposed to exist. The shrink-PR task
-	// widens this deliberately, together with the direction state that makes
-	// it safe.
-	if decision.Direction == sizing.DirectionGrow {
+	// merge — breaking the rule that a shrink is never auto-merged. A shrink
+	// decision on an open shrink PR is handled above, before auto-merge, by
+	// shrinkPRShouldClose; it never reaches here.
+	switch decision.Direction {
+	case sizing.DirectionGrow:
 		logger.Info("PR is open, updating if needed", "prID", prID)
 		if err := r.GitProvider.UpdatePR(ctx, prID, quota.Name, req.Namespace, ns.Annotations, decision.Targets); err != nil {
 			if errors.Is(err, git.ErrFileNotFound) {
@@ -270,11 +274,35 @@ func (r *ResourceQuotaReconciler) handleActivePR(ctx context.Context, req ctrl.R
 			logger.Error(err, "failed to update PR")
 			return ctrl.Result{}, err
 		}
-	} else {
+	case sizing.DirectionShrink:
+		logger.Info("Shrink PR is still open and awaiting review", "prID", prID)
+	default:
 		logger.Info("PR is open but no resize needed currently", "prID", prID)
 	}
 
 	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+}
+
+// shrinkPRShouldClose reports whether an open shrink pull request has to be
+// abandoned, and why. Growth supersedes it because a shortage is a live
+// outage; the TTL catches the case where nobody reviewed it and the lock would
+// otherwise be held indefinitely.
+func shrinkPRShouldClose(
+	policy sizing.Policy,
+	status *git.PRStatus,
+	decision sizing.Decision,
+) (string, bool) {
+	if decision.Direction == sizing.DirectionGrow {
+		return "Superseded: a shortage was detected and the quota has to grow " +
+			"instead.\n\n" + decision.Reason, true
+	}
+	if !status.CreatedAt.IsZero() &&
+		time.Since(status.CreatedAt) > policy.ShrinkPRTTL {
+		return "Closing automatically: this shrink proposal has been open for " +
+			policy.ShrinkPRTTL.String() + " without review. A fresh proposal " +
+			"will be opened once the cooldown expires.", true
+	}
+	return "", false
 }
 
 // handleNewProposal manages the creation of new Pull Requests
@@ -334,13 +362,15 @@ func (r *ResourceQuotaReconciler) handleNewProposal(
 	}
 
 	// 2. Smart Cooldown Check
-	lastMod := state.LastModified
-	if !lastMod.IsZero() {
-		elapsed := time.Since(lastMod)
+	//
+	// A shrink skips this: the shrink cooldown gate in Decide already governs
+	// it, and applying both here would silently double the wait.
+	if decision.Direction == sizing.DirectionGrow && !state.LastModified.IsZero() {
+		elapsed := time.Since(state.LastModified)
 		if elapsed < policy.GrowCooldown {
 			remaining := policy.GrowCooldown - elapsed
-			logger.Info("Skipping resize due to cooldown", "cooldown", policy.GrowCooldown, "remaining", remaining)
-			// Requeue exactly when cooldown expires (plus a small buffer)
+			logger.Info("Skipping resize due to cooldown",
+				"cooldown", policy.GrowCooldown, "remaining", remaining)
 			return ctrl.Result{RequeueAfter: remaining + 1*time.Second}, nil
 		}
 	}
