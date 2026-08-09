@@ -15,8 +15,26 @@ import (
 // MilliValue() wrapping instead of clamping. Verified empirically against
 // the pinned k8s.io/apimachinery v0.36.1: AsScaledInt64 discards the ok flag
 // from a scale conversion that overflows int64, so ScaledValue silently
-// returns a wrapped (and possibly negative) product above this threshold.
+// returns a wrapped (and possibly negative) product above this threshold
+// (16Pi.Value()=18014398509481984, MilliValue()=-432345564227567616).
 const maxMilliValue = math.MaxInt64 / 1000
+
+// overflowsMilliValue reports whether q is too large for MilliValue() to
+// convert safely. "Too large" has two distinct shapes: a Value() above
+// maxMilliValue, where MilliValue() wraps (see above); and, at a much
+// higher magnitude, a Value() that has itself saturated to exactly 0
+// instead of wrapping (verified empirically:
+// resource.MustParse("1E30").Value()==0, .IsZero()==false). The second case
+// would pass a plain "Value() > maxMilliValue" check undetected and then
+// read as an honestly zero quantity — for a hard limit that reads as
+// "resource not in this quota" and is harmless, but for a used value it
+// reads as "fully idle" and can drive a shrink off garbage.
+func overflowsMilliValue(q resource.Quantity) bool {
+	if q.Value() > maxMilliValue {
+		return true
+	}
+	return q.Value() == 0 && !q.IsZero()
+}
 
 // Direction is the kind of change a Decision asks for.
 type Direction int
@@ -76,10 +94,17 @@ type Decision struct {
 	// Targets is what the caller may act on. It is empty unless Direction is
 	// Grow or Shrink.
 	Targets map[corev1.ResourceName]resource.Quantity
-	// ShrinkPreview holds the shrink targets that would be proposed if no gate
-	// blocked them. It exists so the dry-run rollout can report what the
-	// controller would do while shrinking is still switched off. Never act on
-	// it — only Targets is authoritative.
+	// ShrinkPreview holds the step-capped shrink target for every resource
+	// evaluated as a shrink candidate — the same value Targets would carry
+	// if the shrink went ahead — populated even when a gate in BlockedBy
+	// stops it from being proposed. It answers "what would this PR look
+	// like" for a namespace stuck behind a gate, which RawTargets cannot:
+	// RawTargets is the uncapped target and does not reflect the step cap a
+	// real PR would be bound by. Nothing in this codebase reads it outside
+	// tests today — recordDecision (controller/metrics.go) moved to
+	// RawTargets for the metrics — but the value it carries is not
+	// derivable from RawTargets, so it stays. Never act on it directly —
+	// only Targets is authoritative for a pull request.
 	ShrinkPreview map[corev1.ResourceName]resource.Quantity
 	// RawTargets is the uncapped target for every resource Decide evaluated,
 	// independent of the per-PR step cap and the tolerance band. It exists to
@@ -108,9 +133,10 @@ func Decide(in Input) Decision {
 	var growReasons, shrinkReasons []string
 
 	for res, hard := range in.Hard {
-		if hard.Value() > maxMilliValue {
-			// hard.MilliValue() would wrap (not clamp) above this size; treat
-			// the resource as unmeasurable rather than act on garbage.
+		if overflowsMilliValue(hard) {
+			// hard.MilliValue() would wrap or, at a higher magnitude, has
+			// already saturated to a false zero; treat the resource as
+			// unmeasurable rather than act on garbage.
 			continue
 		}
 		hardMilli := hard.MilliValue()
@@ -122,7 +148,7 @@ func Decide(in Input) Decision {
 		if !ok {
 			continue
 		}
-		if used.Value() > maxMilliValue {
+		if overflowsMilliValue(used) {
 			continue
 		}
 		usedMilli := used.MilliValue()

@@ -198,7 +198,17 @@ func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace, dir
 	// out of sync with what the pull request actually does. See
 	// FindOpenPR and directionFromLabels for how the label still serves as
 	// the fallback for pull requests opened before this encoding existed.
-	branchName := fmt.Sprintf("resize/%s-%s-%s-%d", direction, namespace, quotaName, time.Now().Unix())
+	//
+	// The segments are joined with "/", not "-": the legacy shape
+	// (resize/<namespace>-<quota>-<timestamp>) already used "-" as its
+	// separator, so a namespace or quota name that happens to start with
+	// "grow-" or "shrink-" can make a legacy branch byte-identical to a
+	// new-shape one for a *different* namespace/quota pair (namespace
+	// "shrink-team" legacy vs. namespace "team" new-shape shrink both
+	// produce "resize/shrink-team-...-<ts>"). Kubernetes object names cannot
+	// contain "/", so that collision is structurally impossible once "/"
+	// separates the new shape's segments.
+	branchName := fmt.Sprintf("resize/%s/%s/%s/%d", direction, namespace, quotaName, time.Now().Unix())
 	newRef := github.CreateRef{
 		Ref: "refs/heads/" + branchName,
 		SHA: baseRef.Object.GetSHA(),
@@ -395,9 +405,16 @@ func (g *GitHubProvider) UpdatePR(ctx context.Context, prID int, quotaName, name
 // the same recovery path used before this function knew about branch-encoded
 // directions — an in-flight pull request from before the upgrade must still
 // be found, not orphaned.
+//
+// The new-shape prefixes use "/" as their segment separator (see CreatePR):
+// a Kubernetes namespace or quota name cannot contain "/", so
+// growPrefix/shrinkPrefix can never match a legacyPrefix branch from a
+// different namespace/quota pair — unlike an all-"-" scheme, where namespace
+// "shrink-team" and namespace "team" could otherwise both produce
+// "resize/shrink-team-...".
 func (g *GitHubProvider) FindOpenPR(ctx context.Context, namespace, quotaName string) (int, string, error) {
-	growPrefix := fmt.Sprintf("resize/%s-%s-%s-", DirectionGrow, namespace, quotaName)
-	shrinkPrefix := fmt.Sprintf("resize/%s-%s-%s-", DirectionShrink, namespace, quotaName)
+	growPrefix := fmt.Sprintf("resize/%s/%s/%s/", DirectionGrow, namespace, quotaName)
+	shrinkPrefix := fmt.Sprintf("resize/%s/%s/%s/", DirectionShrink, namespace, quotaName)
 	legacyPrefix := fmt.Sprintf("resize/%s-%s-", namespace, quotaName)
 	opts := &github.PullRequestListOptions{
 		State:       "open",

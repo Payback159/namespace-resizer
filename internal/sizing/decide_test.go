@@ -263,10 +263,11 @@ func TestDecide_ZeroHardIsSkipped(t *testing.T) {
 
 func TestDecide_OverflowingHardIsSkipped(t *testing.T) {
 	// Quantity.MilliValue() wraps instead of clamping above roughly 8 PiB
-	// (verified empirically against the pinned k8s.io/apimachinery v0.36.1 —
-	// see the measurements in the final-fixes report). A resource whose hard
-	// limit sits above that threshold must be skipped rather than have the
-	// grow/shrink branches act on a wrapped, possibly negative, milli value.
+	// (verified empirically against the pinned k8s.io/apimachinery v0.36.1:
+	// 16Pi.Value()=18014398509481984, MilliValue()=-432345564227567616). A
+	// resource whose hard limit sits above that threshold must be skipped
+	// rather than have the grow/shrink branches act on a wrapped, possibly
+	// negative, milli value.
 	for _, hard := range []string{"9Pi", "16Pi", "100Pi"} {
 		t.Run(hard, func(t *testing.T) {
 			in := baseInput(hard, "1Pi", "1Pi")
@@ -296,6 +297,47 @@ func TestDecide_OverflowingUsedIsSkipped(t *testing.T) {
 
 	if got.Direction != DirectionNone {
 		t.Fatalf("direction = %v, want none for an overflowing used value", got.Direction)
+	}
+	if len(got.Targets) != 0 {
+		t.Fatalf("Targets = %v, want empty", got.Targets)
+	}
+}
+
+func TestDecide_UsedSaturatingToZeroIsSkipped(t *testing.T) {
+	// Above roughly 9.2e18, Quantity.Value() does not wrap like MilliValue()
+	// does above 8 PiB -- it saturates to exactly 0 instead (verified
+	// empirically: resource.MustParse("1E30").Value()==0, .IsZero()==false).
+	// The plain "Value() > maxMilliValue" guard reads that as an honestly
+	// small value and lets it through: used.MilliValue() then also comes
+	// back 0, which for a "used" quantity means the resource looks
+	// completely idle. On the shrink side that is fail-open, not fail-safe
+	// -- it proposes shrinking a real quota based on garbage.
+	in := baseInput("10", "1E30", "4")
+
+	got := Decide(in)
+
+	if got.Direction != DirectionNone {
+		t.Fatalf("direction = %v, want none for a used value that saturates to zero", got.Direction)
+	}
+	if len(got.Targets) != 0 {
+		t.Fatalf("Targets = %v, want empty", got.Targets)
+	}
+	if _, ok := got.RawTargets[corev1.ResourceRequestsCPU]; ok {
+		t.Fatalf("RawTargets = %v, want no entry for an unmeasurable resource", got.RawTargets)
+	}
+}
+
+func TestDecide_HardSaturatingToZeroIsSkipped(t *testing.T) {
+	// The mirror case on the hard side, for completeness: a saturated-to-zero
+	// hard limit must not be read as hardMilli==0 and quietly skipped by the
+	// (correct, but coincidental) zero-hard guard for the wrong reason, nor
+	// fall through and have grow/shrink act on it.
+	in := baseInput("1E30", "4", "4")
+
+	got := Decide(in)
+
+	if got.Direction != DirectionNone {
+		t.Fatalf("direction = %v, want none for a hard value that saturates to zero", got.Direction)
 	}
 	if len(got.Targets) != 0 {
 		t.Fatalf("Targets = %v, want empty", got.Targets)

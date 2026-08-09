@@ -90,7 +90,18 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	policy, warnings := sizing.ParsePolicy(ns.Annotations, r.BasePolicy)
 	for _, warning := range warnings {
-		logger.V(1).Info("deprecated annotation in use", "detail", warning)
+		if warning.Kind == sizing.WarningRejected {
+			// A rejected value is very likely an operator's mistake having
+			// no effect at all — a deprecation notice at V(1) is exactly
+			// the visibility that made this near-silent before: it needs a
+			// normal-level log line and a Warning event on the namespace,
+			// not a debug line an operator has to go looking for.
+			logger.Info("annotation rejected", "detail", warning.Message)
+			r.Recorder.Event(&ns, corev1.EventTypeWarning,
+				"PolicyAnnotationRejected", warning.Message)
+			continue
+		}
+		logger.V(1).Info("deprecated annotation in use", "detail", warning.Message)
 	}
 	if !policy.Enabled {
 		logger.V(1).Info("Namespace is opted out", "namespace", req.Namespace)

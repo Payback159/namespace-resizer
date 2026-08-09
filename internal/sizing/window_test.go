@@ -145,6 +145,34 @@ func TestWindow_Peak_AllBucketsOverflowingYieldsNoData(t *testing.T) {
 	}
 }
 
+func TestWindow_Peak_BucketSaturatingToZeroYieldsNoData(t *testing.T) {
+	// Above roughly 9.2e18, Value() saturates to exactly 0 instead of
+	// wrapping like MilliValue() does above 8 PiB (verified empirically:
+	// resource.MustParse("1E30").Value()==0, .IsZero()==false). A plain
+	// "Value() > maxMilliValue" check reads that as an honestly-parsed,
+	// honestly-zero quantity and lets it through: MilliValue() then also
+	// comes back 0, and since 0 is never larger than an unset "best", the
+	// bug does not visibly corrupt a mixed window (a real day always wins
+	// the max()) — it only surfaces when nothing else competes, same as
+	// TestWindow_Peak_AllBucketsOverflowingYieldsNoData above, where a
+	// window with only a saturating-to-zero day must report no usable data
+	// rather than an honest-looking peak of zero.
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	w := Window{
+		Version: WindowVersion,
+		Days: []DayBucket{
+			{
+				Date:  now.UTC().AddDate(0, 0, -1).Format(dateLayout),
+				Peaks: map[string]string{"requests.storage": "1E30"},
+			},
+		},
+	}
+
+	if peak, ok := w.Peak(corev1.ResourceRequestsStorage, now, 14); ok {
+		t.Fatalf("Peak = %d, ok = true; want no usable data from a value that saturates to zero", peak)
+	}
+}
+
 func TestWindow_IsComplete(t *testing.T) {
 	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
 

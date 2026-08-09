@@ -37,6 +37,43 @@ func TestParsePolicy_Defaults(t *testing.T) {
 	}
 }
 
+// TestParsePolicy_WarningsCarryTheirKind covers B2: a rejected annotation
+// value must be distinguishable from an honoured-but-deprecated one, so a
+// caller can give it more than a debug-level log line. A deprecated
+// annotation that was actually applied and a rejected one that was ignored
+// are not the same kind of thing an operator needs to see.
+func TestParsePolicy_WarningsCarryTheirKind(t *testing.T) {
+	_, warnings := ParsePolicy(map[string]string{
+		"resizer.io/threshold":       "80", // deprecated, honoured
+		"resizer.io/max-shrink-step": "25", // rejected: missing the leading "0."
+	}, DefaultPolicy())
+
+	if len(warnings) != 2 {
+		t.Fatalf("warnings = %v, want exactly two", warnings)
+	}
+
+	var sawDeprecated, sawRejected bool
+	for _, w := range warnings {
+		switch w.Kind {
+		case WarningDeprecated:
+			sawDeprecated = true
+		case WarningRejected:
+			sawRejected = true
+		default:
+			t.Fatalf("warning %+v has an unrecognised kind", w)
+		}
+		if w.Message == "" {
+			t.Fatalf("warning %+v has an empty message", w)
+		}
+	}
+	if !sawDeprecated {
+		t.Error("no warning carried WarningDeprecated for the honoured threshold annotation")
+	}
+	if !sawRejected {
+		t.Error("no warning carried WarningRejected for the out-of-range max-shrink-step annotation")
+	}
+}
+
 func TestParsePolicy_MigrationChain(t *testing.T) {
 	cases := []struct {
 		name        string

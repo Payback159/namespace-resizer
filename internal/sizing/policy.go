@@ -21,6 +21,28 @@ const (
 	falseValue = "false"
 )
 
+// WarningKind classifies a ParsePolicy warning by how urgently an operator
+// needs to see it.
+type WarningKind int
+
+const (
+	// WarningDeprecated reports an old annotation spelling that was honoured
+	// exactly as before. Expected, low-noise: any namespace that has not
+	// migrated to the headroom annotations produces one on every reconcile.
+	WarningDeprecated WarningKind = iota
+	// WarningRejected reports an annotation value that failed validation and
+	// was ignored — the field keeps whatever it already held (or, for
+	// shrink-enabled, is switched off). This is very likely an operator's
+	// mistake having no effect and needs more than debug-level visibility.
+	WarningRejected
+)
+
+// PolicyWarning is one thing ParsePolicy wants the operator to know about.
+type PolicyWarning struct {
+	Kind    WarningKind
+	Message string
+}
+
 // Policy is the effective configuration for one quota, after merging global
 // defaults with namespace annotations.
 type Policy struct {
@@ -109,54 +131,55 @@ func resourceFamily(res corev1.ResourceName) (corev1.ResourceName, bool) {
 }
 
 // parseScalar applies one non-headroom, non-increment, non-threshold
-// annotation and returns a warning string, empty when there is nothing to
-// say. A value that fails to parse or falls outside the annotation's valid
-// range is rejected: the field keeps its current value (the default, unless
-// a global flag already set it) and the rejection is reported as a warning
-// rather than silently dropped, so a plausible-looking typo does not read
-// to the operator as "no annotation was written".
-func parseScalar(name, value string, out *Policy) string {
+// annotation and returns a warning, whose Message is empty when there is
+// nothing to say. A value that fails to parse or falls outside the
+// annotation's valid range is rejected: the field keeps its current value
+// (the default, unless a global flag already set it) and the rejection is
+// reported as a WarningRejected warning rather than silently dropped, so a
+// plausible-looking typo does not read to the operator as "no annotation
+// was written".
+func parseScalar(name, value string, out *Policy) PolicyWarning {
 	switch {
 	case strings.HasSuffix(name, "-min"):
 		if q, err := resource.ParseQuantity(value); err == nil {
 			out.Min[corev1.ResourceName(strings.TrimSuffix(name, "-min"))] = q
-			return ""
+			return PolicyWarning{}
 		}
 		return rejectionWarning(name, value, "must be a valid resource quantity")
 	case name == "tolerance":
 		if v, ok := parseFraction(value); ok && v >= 0 && v < 1 {
 			out.Tolerance = v
-			return ""
+			return PolicyWarning{}
 		}
 		return rejectionWarning(name, value, "must be a fraction in [0, 1), e.g. \"0.15\" or \"15%\"")
 	case name == "max-shrink-step":
 		if v, ok := parseFraction(value); ok && v > 0 && v < 1 {
 			out.MaxShrinkStep = v
-			return ""
+			return PolicyWarning{}
 		}
 		return rejectionWarning(name, value, "must be a fraction in (0, 1), e.g. \"0.25\" or \"25%\"")
 	case name == "window-days":
 		if v, err := strconv.Atoi(value); err == nil && v > 0 {
 			out.WindowDays = v
-			return ""
+			return PolicyWarning{}
 		}
 		return rejectionWarning(name, value, "must be a positive integer")
 	case name == "shrink-cooldown-days":
 		if v, err := strconv.Atoi(value); err == nil && v >= 0 {
 			out.ShrinkCooldown = time.Duration(v) * 24 * time.Hour
-			return ""
+			return PolicyWarning{}
 		}
 		return rejectionWarning(name, value, "must be a non-negative integer")
 	case name == "shrink-pr-ttl-days":
 		if v, err := strconv.Atoi(value); err == nil && v > 0 {
 			out.ShrinkPRTTL = time.Duration(v) * 24 * time.Hour
-			return ""
+			return PolicyWarning{}
 		}
 		return rejectionWarning(name, value, "must be a positive integer")
 	case name == "cooldown-minutes":
 		if v, err := strconv.Atoi(value); err == nil && v >= 0 {
 			out.GrowCooldown = time.Duration(v) * time.Minute
-			return ""
+			return PolicyWarning{}
 		}
 		return rejectionWarning(name, value, "must be a non-negative integer")
 	case name == "enabled":
@@ -164,15 +187,18 @@ func parseScalar(name, value string, out *Policy) string {
 	case name == "shrink-enabled":
 		return parseShrinkOptOut(value, out)
 	}
-	return ""
+	return PolicyWarning{}
 }
 
 // rejectionWarning reports an annotation value that failed validation. The
 // field it targeted keeps whatever it already held.
-func rejectionWarning(name, value, requirement string) string {
-	return fmt.Sprintf(
-		"annotation %s%s has the invalid value %q, so it is ignored and the previous value is kept (%s)",
-		AnnotationPrefix, name, value, requirement)
+func rejectionWarning(name, value, requirement string) PolicyWarning {
+	return PolicyWarning{
+		Kind: WarningRejected,
+		Message: fmt.Sprintf(
+			"annotation %s%s has the invalid value %q, so it is ignored and the previous value is kept (%s)",
+			AnnotationPrefix, name, value, requirement),
+	}
 }
 
 // parseShrinkOptOut applies the shrink-enabled annotation, which is opt-out
@@ -182,27 +208,35 @@ func rejectionWarning(name, value, requirement string) string {
 // Only an explicit "true" leaves shrinking as the flag left it. Every other
 // value switches it off, because the sole reason to write this annotation is
 // to opt out, and a spelling we do not recognise is far likelier to be an
-// attempt at that than a request to keep shrinking on.
-func parseShrinkOptOut(value string, out *Policy) string {
+// attempt at that than a request to keep shrinking on. An unrecognised value
+// is a WarningRejected warning, same as any other invalid annotation value —
+// it silently changed the effective policy (shrinking is now off) and an
+// operator relying on shrinking needs to see that, not a debug line.
+func parseShrinkOptOut(value string, out *Policy) PolicyWarning {
 	switch {
 	case strings.EqualFold(value, trueValue):
-		return ""
+		return PolicyWarning{}
 	case strings.EqualFold(value, falseValue):
 		out.ShrinkEnabled = false
-		return ""
+		return PolicyWarning{}
 	default:
 		out.ShrinkEnabled = false
-		return fmt.Sprintf("annotation %sshrink-enabled has the unrecognised "+
-			"value %q, so shrinking is switched off for this namespace; "+
-			"use \"true\" or \"false\"", AnnotationPrefix, value)
+		return PolicyWarning{
+			Kind: WarningRejected,
+			Message: fmt.Sprintf("annotation %sshrink-enabled has the unrecognised "+
+				"value %q, so shrinking is switched off for this namespace; "+
+				"use \"true\" or \"false\"", AnnotationPrefix, value),
+		}
 	}
 }
 
 // ParsePolicy merges namespace annotations onto base. It returns the effective
 // policy plus a warning for every annotation worth telling the operator about:
-// one per deprecated annotation that was honoured, and one for a shrink-enabled
-// value that was not recognised.
-func ParsePolicy(annotations map[string]string, base Policy) (Policy, []string) {
+// one per deprecated annotation that was honoured, and one per annotation
+// value that failed validation and was rejected (including an unrecognised
+// shrink-enabled value). Each warning's Kind says which of the two it is —
+// see WarningDeprecated and WarningRejected.
+func ParsePolicy(annotations map[string]string, base Policy) (Policy, []PolicyWarning) {
 	out := base
 	out.Headroom = copyFloatMap(base.Headroom)
 	out.Min = copyQuantityMap(base.Min)
@@ -212,7 +246,7 @@ func ParsePolicy(annotations map[string]string, base Policy) (Policy, []string) 
 	fromHeadroom := map[corev1.ResourceName]float64{}
 	fromIncrement := map[corev1.ResourceName]float64{}
 	fromThreshold := map[corev1.ResourceName]float64{}
-	var warnings []string
+	var warnings []PolicyWarning
 
 	for key, value := range annotations {
 		if !strings.HasPrefix(key, AnnotationPrefix) {
@@ -243,7 +277,7 @@ func ParsePolicy(annotations map[string]string, base Policy) (Policy, []string) 
 					"must be a percentage in (0, 100]"))
 			}
 		default:
-			if w := parseScalar(name, value, &out); w != "" {
+			if w := parseScalar(name, value, &out); w.Message != "" {
 				warnings = append(warnings, w)
 			}
 		}
@@ -301,14 +335,17 @@ func parseFraction(value string) (float64, bool) {
 	return v, true
 }
 
-func deprecationWarning(res corev1.ResourceName, old string) string {
+func deprecationWarning(res corev1.ResourceName, old string) PolicyWarning {
 	prefix := string(res) + "-"
 	if res == DefaultKey {
 		prefix = ""
 	}
-	return fmt.Sprintf(
-		"annotation %s%s%s is deprecated, use %s%sheadroom instead",
-		AnnotationPrefix, prefix, old, AnnotationPrefix, prefix)
+	return PolicyWarning{
+		Kind: WarningDeprecated,
+		Message: fmt.Sprintf(
+			"annotation %s%s%s is deprecated, use %s%sheadroom instead",
+			AnnotationPrefix, prefix, old, AnnotationPrefix, prefix),
+	}
 }
 
 func copyFloatMap(in map[corev1.ResourceName]float64) map[corev1.ResourceName]float64 {

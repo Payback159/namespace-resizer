@@ -560,3 +560,68 @@ func TestFindOpenPR_LegacyBranchFallsBackToLabel(t *testing.T) {
 	g.Expect(id).To(Equal(9))
 	g.Expect(direction).To(Equal(DirectionShrink))
 }
+
+// TestFindOpenPR_ShrinkPrefixedNamespaceDoesNotCollideWithSiblingsShrinkBranch
+// covers the B1 finding: a legacy-shape branch belonging to namespace
+// "shrink-team" is byte-identical to what the new shrink-direction shape
+// produces for namespace "team". A single pull request must not answer for
+// both queries with two different, and for one of them wrong, directions.
+func TestFindOpenPR_ShrinkPrefixedNamespaceDoesNotCollideWithSiblingsShrinkBranch(t *testing.T) {
+	g := NewWithT(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// This pull request belongs to namespace "shrink-team", quota
+		// "compute", and predates direction-in-branch (no labels).
+		_, _ = fmt.Fprint(w, `[{
+			"number": 77,
+			"head": {"ref": "resize/shrink-team-compute-1700000000"}
+		}]`)
+	})
+	provider, teardown := newTestProvider(t, mux)
+	defer teardown()
+
+	// A query for namespace "team" must not find a pull request that
+	// belongs to namespace "shrink-team".
+	id, _, err := provider.FindOpenPR(context.Background(), "team", "compute")
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(id).To(Equal(0),
+		"a pull request belonging to namespace shrink-team must not answer for namespace team")
+
+	// The actual owner, "shrink-team", must still find it and resolve its
+	// direction through the label fallback (none present -> grow).
+	id, direction, err := provider.FindOpenPR(context.Background(), "shrink-team", "compute")
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(id).To(Equal(77))
+	g.Expect(direction).To(Equal(DirectionGrow))
+}
+
+// TestFindOpenPR_NewShapeAndLegacySiblingBothResolveCorrectly is the
+// two-pull-request version of the same case: namespace "team" has its own
+// new-shape shrink branch open at the same time namespace "shrink-team" has
+// a legacy-shape branch open, and each query must find only its own.
+func TestFindOpenPR_NewShapeAndLegacySiblingBothResolveCorrectly(t *testing.T) {
+	g := NewWithT(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `[
+			{"number": 201, "head": {"ref": "resize/shrink/team/compute/1700000000"}},
+			{"number": 202, "head": {"ref": "resize/shrink-team-compute-1700000001"}}
+		]`)
+	})
+	provider, teardown := newTestProvider(t, mux)
+	defer teardown()
+
+	id, direction, err := provider.FindOpenPR(context.Background(), "team", "compute")
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(id).To(Equal(201))
+	g.Expect(direction).To(Equal(DirectionShrink))
+
+	id, direction, err = provider.FindOpenPR(context.Background(), "shrink-team", "compute")
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(id).To(Equal(202))
+	g.Expect(direction).To(Equal(DirectionGrow))
+}
