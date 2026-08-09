@@ -191,7 +191,14 @@ func (g *GitHubProvider) CreatePR(ctx context.Context, quotaName, namespace, dir
 	}
 
 	// 2. Create new branch
-	branchName := fmt.Sprintf("resize/%s-%s-%d", namespace, quotaName, time.Now().Unix())
+	//
+	// The branch name carries the direction. It is created atomically with the
+	// pull request (this same call), so unlike the direction label — a
+	// separate API call that can fail on its own — it can never end up
+	// out of sync with what the pull request actually does. See
+	// FindOpenPR and directionFromLabels for how the label still serves as
+	// the fallback for pull requests opened before this encoding existed.
+	branchName := fmt.Sprintf("resize/%s-%s-%s-%d", direction, namespace, quotaName, time.Now().Unix())
 	newRef := github.CreateRef{
 		Ref: "refs/heads/" + branchName,
 		SHA: baseRef.Object.GetSHA(),
@@ -380,8 +387,18 @@ func (g *GitHubProvider) UpdatePR(ctx context.Context, prID int, quotaName, name
 // the one whose head branch matches the deterministic resizer branch prefix
 // for the given namespace/quota. Returns 0 and an empty direction if no
 // matching open PR exists.
+//
+// The direction is read from the branch name whenever the branch was created
+// with it encoded (see CreatePR): that is structurally reliable, since the
+// branch and the pull request are created in the same call and cannot drift
+// apart. A branch predating that encoding falls back to directionFromLabels,
+// the same recovery path used before this function knew about branch-encoded
+// directions — an in-flight pull request from before the upgrade must still
+// be found, not orphaned.
 func (g *GitHubProvider) FindOpenPR(ctx context.Context, namespace, quotaName string) (int, string, error) {
-	prefix := fmt.Sprintf("resize/%s-%s-", namespace, quotaName)
+	growPrefix := fmt.Sprintf("resize/%s-%s-%s-", DirectionGrow, namespace, quotaName)
+	shrinkPrefix := fmt.Sprintf("resize/%s-%s-%s-", DirectionShrink, namespace, quotaName)
+	legacyPrefix := fmt.Sprintf("resize/%s-%s-", namespace, quotaName)
 	opts := &github.PullRequestListOptions{
 		State:       "open",
 		ListOptions: github.ListOptions{PerPage: 100},
@@ -393,10 +410,18 @@ func (g *GitHubProvider) FindOpenPR(ctx context.Context, namespace, quotaName st
 			return 0, "", fmt.Errorf("failed to list pull requests: %w", err)
 		}
 		for _, pr := range prs {
-			if pr.Head == nil || !strings.HasPrefix(pr.Head.GetRef(), prefix) {
+			if pr.Head == nil {
 				continue
 			}
-			return pr.GetNumber(), directionFromLabels(pr.Labels), nil
+			ref := pr.Head.GetRef()
+			switch {
+			case strings.HasPrefix(ref, growPrefix):
+				return pr.GetNumber(), DirectionGrow, nil
+			case strings.HasPrefix(ref, shrinkPrefix):
+				return pr.GetNumber(), DirectionShrink, nil
+			case strings.HasPrefix(ref, legacyPrefix):
+				return pr.GetNumber(), directionFromLabels(pr.Labels), nil
+			}
 		}
 		if resp.NextPage == 0 {
 			break

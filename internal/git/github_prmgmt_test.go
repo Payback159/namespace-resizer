@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -450,4 +451,112 @@ func TestCreatePR_GrowSurvivesLabellingFailure(t *testing.T) {
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(prID).To(Equal(101))
 	g.Expect(closeCalled).To(BeFalse())
+}
+
+// TestFindOpenPR_ShrinkSurvivesLabelAndCloseFailure covers the split-brain
+// finding: when both the label write and the take-back close fail, the pull
+// request is left open on GitHub with no direction label. The next
+// FindOpenPR must not classify it as a grow just because directionFromLabels
+// would default an unlabelled PR that way — it has to recover "shrink" from
+// the branch name the PR was created with, since the branch is created
+// atomically with the PR and cannot fail independently of it.
+func TestFindOpenPR_ShrinkSurvivesLabelAndCloseFailure(t *testing.T) {
+	g := NewWithT(t)
+	original := labelRetryBackoff
+	labelRetryBackoff = 0
+	t.Cleanup(func() { labelRetryBackoff = original })
+
+	var capturedRef string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"default_branch": "main"}`)
+	})
+	mux.HandleFunc("/repos/o/r/git/ref/heads/main", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"object": {"sha": "base-sha"}}`)
+	})
+	mux.HandleFunc("/repos/o/r/git/refs", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"ref": "refs/heads/new-branch"}`)
+	})
+	mux.HandleFunc("/repos/o/r/contents/managed-resources/cluster/default", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[{"name": "quota.yaml", "path": "managed-resources/cluster/default/quota.yaml", "type": "file"}]`)
+	})
+	mux.HandleFunc("/repos/o/r/contents/managed-resources/cluster/default/quota.yaml", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = fmt.Fprint(w, `{"content": "a2luZDogUmVzb3VyY2VRdW90YQptZXRhZGF0YToKICBuYW1lOiBteS1xdW90YQpzcGVjOgogIGhhcmQ6CiAgICByZXF1ZXN0cy5jcHU6IDE=", "encoding": "base64", "sha": "file-sha"}`)
+		case http.MethodPut:
+			_, _ = fmt.Fprint(w, `{"commit": {"sha": "new-sha"}}`)
+		}
+	})
+	mux.HandleFunc("/repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			var payload struct {
+				Head string `json:"head"`
+			}
+			body, err := io.ReadAll(r.Body)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(json.Unmarshal(body, &payload)).To(Succeed())
+			capturedRef = payload.Head
+			_, _ = fmt.Fprint(w, `{"number": 101, "state": "open"}`)
+		case http.MethodGet:
+			// The PR that CreatePR could neither label nor close, still open
+			// with the branch it was created on and no direction label.
+			g.Expect(capturedRef).ToNot(BeEmpty(), "PR creation must have happened first")
+			_, _ = fmt.Fprintf(w, `[{"number": 101, "head": {"ref": %q}}]`, capturedRef)
+		}
+	})
+	// Both the label write and the take-back close fail: same client, same
+	// token, same permission scope, so a single outage takes both down
+	// together, exactly as the finding describes.
+	mux.HandleFunc("/repos/o/r/issues/101/labels", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/repos/o/r/issues/101/comments", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	provider, teardown := newTestProvider(t, mux)
+	defer teardown()
+
+	prID, err := provider.CreatePR(context.Background(), "my-quota", "default", DirectionShrink, nil, createPRLimits())
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(prID).To(Equal(0), "nothing must be persisted on the lease for an unrecovered PR")
+
+	foundID, direction, err := provider.FindOpenPR(context.Background(), "default", "my-quota")
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(foundID).To(Equal(101))
+	g.Expect(direction).To(Equal(DirectionShrink),
+		"the branch name must carry the direction; falling back to the "+
+			"no-label default would re-adopt this shrink as a grow and make "+
+			"it auto-merge eligible")
+}
+
+// TestFindOpenPR_LegacyBranchFallsBackToLabel verifies that a PR opened
+// before branches encoded their direction is still matched (never orphaned)
+// and resolves its direction from the label, exactly as before.
+func TestFindOpenPR_LegacyBranchFallsBackToLabel(t *testing.T) {
+	g := NewWithT(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `[{
+			"number": 9,
+			"head": {"ref": "resize/team-a-compute-1700000000"},
+			"labels": [
+				{"name": "resizer/managed"},
+				{"name": "resizer/direction:shrink"}
+			]
+		}]`)
+	})
+	provider, teardown := newTestProvider(t, mux)
+	defer teardown()
+
+	id, direction, err := provider.FindOpenPR(context.Background(), "team-a", "compute")
+
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(id).To(Equal(9))
+	g.Expect(direction).To(Equal(DirectionShrink))
 }

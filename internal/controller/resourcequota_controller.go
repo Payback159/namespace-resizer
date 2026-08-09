@@ -25,6 +25,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -68,6 +69,15 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// 1. Fetch ResourceQuota
 	var quota corev1.ResourceQuota
 	if err := r.Get(ctx, req.NamespacedName, &quota); err != nil {
+		if apierrors.IsNotFound(err) {
+			// The quota is gone: drop its cached window so the map does not
+			// grow for the rest of the process lifetime, and so that
+			// recreating the quota (the documented remedy for a stuck
+			// observation window) takes effect immediately instead of
+			// waiting for a controller restart. A stale cache miss here
+			// just costs one extra Lease read on the next reconcile.
+			r.Observer.Forget(req.Namespace, req.Name)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 

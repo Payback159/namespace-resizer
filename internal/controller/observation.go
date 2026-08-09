@@ -25,11 +25,16 @@ type Observer struct {
 	locker *lock.LeaseLocker
 	now    func() time.Time
 
-	// mu protects only the cached map, never spanning API calls. controller-runtime
-	// never reconciles the same object concurrently, so two Observe calls for the
-	// same key cannot overlap; only the map entry (key) itself needs protection, not
-	// reads or writes to the window's content. Different keys require only the map's
-	// internal synchronization to be safe.
+	// mu protects the cached map and is held for every access to it (see the
+	// lock/unlock pairs around the read and the write below), but never
+	// spans an API call: it is released before GetState/MutateState run and
+	// re-acquired only to store the result. Go maps have no synchronization
+	// of their own — concurrent access to any keys of the same map,
+	// including distinct ones, is a data race without this mutex. What makes
+	// concurrent Observe calls for different keys safe here is that
+	// controller-runtime never reconciles the same object twice at once, so
+	// two calls touching the same key cannot overlap, and mu still
+	// serialises the (rare, cheap) case where they touch different keys.
 	mu     sync.Mutex
 	cached map[string]sizing.Window
 }
