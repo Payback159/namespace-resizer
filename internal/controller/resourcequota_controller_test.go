@@ -255,3 +255,63 @@ func TestReconcile_RejectedAnnotationFiresWarningEvent(t *testing.T) {
 		t.Fatal("no event recorded for a rejected annotation")
 	}
 }
+
+// TestReconcile_DeprecatedAnnotationFiresNoEvent is the other half of the
+// rejection event. A deprecated annotation is honoured, not ignored, so it
+// warrants a log line and nothing louder. Without this assertion, widening
+// the event to every warning kind would pass every other test in the package
+// — and would put a standing Warning on every namespace that has not yet
+// migrated off the old annotation names.
+func TestReconcile_DeprecatedAnnotationFiresNoEvent(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = coordinationv1.AddToScheme(scheme)
+
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "team-a",
+			Annotations: map[string]string{
+				// Deprecated but valid: migrated to headroom, and honoured.
+				"resizer.io/cpu-threshold": "80",
+			},
+		},
+	}
+	quota := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "compute", Namespace: "team-a", UID: types.UID("uid-1"),
+		},
+		Status: corev1.ResourceQuotaStatus{
+			Hard: corev1.ResourceList{
+				corev1.ResourceRequestsCPU: resource.MustParse("10"),
+			},
+			Used: corev1.ResourceList{
+				corev1.ResourceRequestsCPU: resource.MustParse("4"),
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ns, quota).Build()
+	locker := lock.NewLeaseLocker(c)
+	recorder := record.NewFakeRecorder(10)
+
+	reconciler := &ResourceQuotaReconciler{
+		Client: c, Scheme: scheme, Recorder: recorder,
+		GitProvider: &FakeGitProvider{}, Locker: locker,
+		Observer:   NewObserver(locker, time.Now),
+		BasePolicy: sizing.DefaultPolicy(),
+	}
+
+	_, err := reconciler.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "compute", Namespace: "team-a"},
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	select {
+	case event := <-recorder.Events:
+		t.Fatalf("a deprecated annotation must not raise an event, got %q", event)
+	default:
+	}
+}

@@ -625,3 +625,75 @@ func TestFindOpenPR_NewShapeAndLegacySiblingBothResolveCorrectly(t *testing.T) {
 	g.Expect(id).To(Equal(202))
 	g.Expect(direction).To(Equal(DirectionGrow))
 }
+
+// TestFindOpenPR_OwnNewShapePRBeatsAnAmbiguousLegacyOne pins that a
+// legacy match never wins on list position alone.
+//
+// The legacy shape cannot say where the namespace ends and the quota begins:
+// "resize/team-a-compute-…" reads equally as namespace "team-a" quota
+// "compute" and as namespace "team" quota "a-compute". So a query for
+// ("team", "a-compute") matches a branch that in fact belongs to a
+// neighbouring namespace. If the scan returned the first match in list order,
+// GitHub's ordering would decide whether "team" adopts its own pull request
+// or its neighbour's — and adopting the neighbour's means recording it in
+// "team"'s lease, where it becomes a merge and update candidate. Listing the
+// ambiguous legacy entry first is the case that must not decide anything.
+func TestFindOpenPR_OwnNewShapePRBeatsAnAmbiguousLegacyOne(t *testing.T) {
+	g := NewWithT(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `[
+			{"number": 501, "head": {"ref": "resize/team-a-compute-1700000000"}},
+			{"number": 500, "head": {"ref": "resize/shrink/team/a-compute/1700000001"}}
+		]`)
+	})
+	provider, teardown := newTestProvider(t, mux)
+	defer teardown()
+
+	id, direction, err := provider.FindOpenPR(context.Background(), "team", "a-compute")
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(id).To(Equal(500),
+		"the namespace's own unambiguous pull request must win over an ambiguous legacy match listed before it")
+	g.Expect(direction).To(Equal(DirectionShrink))
+
+	// The legacy pull request still answers for the namespace that really
+	// owns it, which has no new-shape pull request of its own.
+	id, direction, err = provider.FindOpenPR(context.Background(), "team-a", "compute")
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(id).To(Equal(501))
+	g.Expect(direction).To(Equal(DirectionGrow))
+}
+
+// TestFindOpenPR_QuotaNameIsNotMatchedAsAPrefix pins the trailing "/" on the
+// new-shape prefixes. Without it, quota "compute" would match a branch
+// belonging to quota "compute2", and the controller would adopt and then
+// rewrite a different quota's pull request.
+func TestFindOpenPR_QuotaNameIsNotMatchedAsAPrefix(t *testing.T) {
+	g := NewWithT(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `[
+			{"number": 300, "head": {"ref": "resize/grow/team/compute2/1700000000"}}
+		]`)
+	})
+	provider, teardown := newTestProvider(t, mux)
+	defer teardown()
+
+	id, _, err := provider.FindOpenPR(context.Background(), "team", "compute")
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(id).To(Equal(0),
+		"quota compute must not match a branch belonging to quota compute2")
+
+	// The namespace is guarded the same way.
+	id, _, err = provider.FindOpenPR(context.Background(), "tea", "compute2")
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(id).To(Equal(0), "namespace tea must not match a branch belonging to namespace team")
+
+	id, _, err = provider.FindOpenPR(context.Background(), "team", "compute2")
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(id).To(Equal(300))
+}

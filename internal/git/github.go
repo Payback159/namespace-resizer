@@ -412,6 +412,15 @@ func (g *GitHubProvider) UpdatePR(ctx context.Context, prID int, quotaName, name
 // different namespace/quota pair — unlike an all-"-" scheme, where namespace
 // "shrink-team" and namespace "team" could otherwise both produce
 // "resize/shrink-team-...".
+//
+// A legacy match is only ever a fallback, never a first-past-the-post win.
+// The legacy shape is ambiguous in a way the new one is not — "resize/team-a-
+// compute-…" belongs to namespace "team-a" quota "compute" and to namespace
+// "team" quota "a-compute" alike — so a namespace that has its own new-shape
+// pull request must adopt that one regardless of where GitHub happens to list
+// the two. Deciding per pull request would hand the outcome to list order and
+// let a namespace adopt a neighbour's pull request, then update, close or
+// merge it.
 func (g *GitHubProvider) FindOpenPR(ctx context.Context, namespace, quotaName string) (int, string, error) {
 	growPrefix := fmt.Sprintf("resize/%s/%s/%s/", DirectionGrow, namespace, quotaName)
 	shrinkPrefix := fmt.Sprintf("resize/%s/%s/%s/", DirectionShrink, namespace, quotaName)
@@ -420,6 +429,9 @@ func (g *GitHubProvider) FindOpenPR(ctx context.Context, namespace, quotaName st
 		State:       "open",
 		ListOptions: github.ListOptions{PerPage: 100},
 	}
+
+	legacyID := 0
+	legacyDirection := ""
 
 	for {
 		prs, resp, err := g.client.PullRequests.List(ctx, g.owner, g.repo, opts)
@@ -437,13 +449,19 @@ func (g *GitHubProvider) FindOpenPR(ctx context.Context, namespace, quotaName st
 			case strings.HasPrefix(ref, shrinkPrefix):
 				return pr.GetNumber(), DirectionShrink, nil
 			case strings.HasPrefix(ref, legacyPrefix):
-				return pr.GetNumber(), directionFromLabels(pr.Labels), nil
+				if legacyID == 0 {
+					legacyID = pr.GetNumber()
+					legacyDirection = directionFromLabels(pr.Labels)
+				}
 			}
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		opts.Page = resp.NextPage
+	}
+	if legacyID != 0 {
+		return legacyID, legacyDirection, nil
 	}
 	return 0, "", nil
 }

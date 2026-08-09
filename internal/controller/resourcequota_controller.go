@@ -97,7 +97,12 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			// normal-level log line and a Warning event on the namespace,
 			// not a debug line an operator has to go looking for.
 			logger.Info("annotation rejected", "detail", warning.Message)
-			r.Recorder.Event(&ns, corev1.EventTypeWarning,
+			// Recorded against the quota, not the namespace it was annotated
+			// on: a Namespace is cluster-scoped, so its event carries no
+			// namespace of its own and the API server files it under
+			// "default" — where nobody looking at the affected namespace
+			// would find it.
+			r.Recorder.Event(&quota, corev1.EventTypeWarning,
 				"PolicyAnnotationRejected", warning.Message)
 			continue
 		}
