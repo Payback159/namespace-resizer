@@ -100,9 +100,14 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	deficits, err := r.collectDeficits(ctx, quota, state.LastModified)
+	deficitScanFailed := err != nil
 	if err != nil {
 		// A failed event scan must not stop the metric-driven path; it only
 		// means a pending shortage may be reacted to one reconcile later.
+		//
+		// It is not symmetric, though: a missing deficit can only lower the
+		// target, so a failed scan could tip a quota from "no action" into
+		// "shrink". The guard below stops that shrink from being proposed.
 		logger.Error(err, "failed to collect event deficits")
 	}
 
@@ -125,6 +130,12 @@ func (r *ResourceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	if state.PRID != 0 {
 		return r.handleActivePR(ctx, req, quota, ns, policy, state, decision)
+	}
+
+	if decision.Direction == sizing.DirectionShrink && deficitScanFailed {
+		logger.Info("Shrink suppressed: the event scan failed, so the " +
+			"target may be understated")
+		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 	}
 
 	if decision.Direction != sizing.DirectionNone {
