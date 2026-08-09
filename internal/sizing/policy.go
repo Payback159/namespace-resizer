@@ -155,7 +155,9 @@ func parseShrinkOptOut(value string, out *Policy) string {
 }
 
 // ParsePolicy merges namespace annotations onto base. It returns the effective
-// policy plus one warning per deprecated annotation that was honoured.
+// policy plus a warning for every annotation worth telling the operator about:
+// one per deprecated annotation that was honoured, and one for a shrink-enabled
+// value that was not recognised.
 func ParsePolicy(annotations map[string]string, base Policy) (Policy, []string) {
 	out := base
 	out.Headroom = copyFloatMap(base.Headroom)
